@@ -1,0 +1,61 @@
+# =============================================================================
+# AI Runtime CLI job spec (the `air run --file` target).
+#
+# This is the PER-RUN template. run_sweep.py fills in the placeholders and
+# submits one of these per grid cell. You normally never call `air run` on this
+# file directly — run_sweep.py does it for you — but you can, for a single
+# manual run, by replacing the PLACEHOLDER_* values yourself.
+#
+# Launcher note: run_sweep.py sets `command:` based on grid.yaml's
+# num_accelerators. For Qwen3-8B full-FT (8xH100) it emits an
+# `accelerate launch --config_file accelerate_fsdp.yaml -m axolotl.cli.train`
+# command so FSDP shards the model across the 8 GPUs. For a single-GPU model it
+# emits a bare `axolotl train`. The `command:` below is only a default for
+# manual `air run --file` invocations; the driver overwrites it.
+# =============================================================================
+
+experiment_name: PLACEHOLDER_MLFLOW_EXPERIMENT   # e.g. /Users/q.yu@databricks.com/qwen-ft-sweep
+mlflow_run_name: PLACEHOLDER_RUN_NAME            # e.g. lr2e-06_ep5
+
+environment:
+  version: '5'                                   # AI v5 (PyTorch/Transformers preloaded)
+  dependencies:
+    # axolotl 0.13.1 hard-pins trl==0.25.1 and torchao==0.13.0 (see its
+    # requirements.txt). Overriding either makes uv's resolver fail at env build,
+    # so match them exactly. mlflow is left unpinned (axolotl doesn't constrain it).
+    #
+    # NOTE: the [flash-attn] extra is intentionally OMITTED. flash-attn is a CUDA
+    # C++ extension that compiles against torch at build time; under uv's build
+    # isolation the build can't see AIR's preinstalled torch and fails with
+    # "No module named 'torch'". For this sweep we run with flash_attention:false
+    # (SDPA attention — same correctness, slightly slower). To re-enable for a
+    # perf run, add the extra AND `--no-build-isolation` + `--no-deps` before it.
+    - "axolotl==0.13.1"
+    - "trl==0.25.1"
+    - "torchao==0.13.0"
+    # torchvision is NOT preinstalled on AIR v5 (only torch is). axolotl 0.13.1
+    # imports transformers' SmolVLMProcessor at trainer-build time, which pulls
+    # transformers' smolvlm video processor -> `from torchvision.transforms.v2`.
+    # Without torchvision that import fails and training dies before step 1.
+    # 0.23.0 is the match for the preinstalled torch 2.8.0 (avoids pulling a new torch).
+    - "torchvision==0.23.0"
+    - "mlflow"
+
+compute:
+  num_accelerators: PLACEHOLDER_NUM_ACCEL        # 8 (Qwen3-8B full FT)
+  accelerator_type: PLACEHOLDER_ACCEL_TYPE       # GPU_8xH100
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: PLACEHOLDER_ROOT_PATH             # abs path to qwen-ft-sweep/ (run_sweep.py fills this)
+
+# $CODE_SOURCE_PATH is where the snapshot lands. run_sweep.py OVERWRITES this
+# command per-run: for num_accelerators > 1 it emits the accelerate+FSDP launch
+# below; for a single GPU it emits a bare `axolotl train`. Generated axolotl
+# configs live at configs/generated/ inside the snapshot.
+command: |
+  accelerate launch --config_file $CODE_SOURCE_PATH/configs/accelerate_fsdp.yaml -m axolotl.cli.train $CODE_SOURCE_PATH/configs/generated/PLACEHOLDER_AXOLOTL_CONFIG
+
+max_retries: 1
+timeout_minutes: 240

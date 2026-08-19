@@ -1,0 +1,54 @@
+# =============================================================================
+# Sweep grid — the ONLY file you edit to change the experiment.
+# Mirrors agency-01_finetuning.py, which swept learning_rate (and, across
+# runs, epochs). Here we sweep exactly those two axes; everything else is fixed
+# in axolotl_base.yaml.
+#
+# run_sweep.py takes the cartesian product of learning_rates x epochs and submits
+# one AI Runtime job per cell.
+# =============================================================================
+
+model: Qwen/Qwen3-8B
+
+# --- the two swept axes -------------------------------------------------------
+# SMALL end-to-end test grid: 1 epoch x 2 LRs = 2 cells, to validate the full
+# train -> eval -> pick-best flow cheaply before the full sweep. Restore the
+# commented values below for the real 4x2 = 8-cell run.
+learning_rates:
+  - 1.0e-6
+  - 2.0e-6
+  - 5.0e-6
+  - 1.0e-5
+
+epochs:
+  - 3
+  - 4
+  - 5
+
+# 2 LRs x 1 epoch = 2 runs. Add/remove list items to resize the sweep.
+
+# --- submission behaviour -----------------------------------------------------
+# watch: true  -> submit runs one at a time, streaming logs (air run --watch).
+# watch: false -> fire-and-forget; all runs queue on serverless GPU in parallel.
+watch: false
+
+# Serverless GPU accelerator. Qwen3-8B FULL fine-tune does NOT fit on a single
+# H100 — it needs FSDP sharding across 8xH100. run_sweep.py detects
+# num_accelerators > 1 and emits an `accelerate launch --config_file
+# accelerate_fsdp.yaml` command (instead of a bare `axolotl train`).
+accelerator_type: GPU_8xH100
+num_accelerators: 8
+
+# Evaluation is NOT run by this driver — it's done in the notebook
+# notebooks/eval_sweep_checkpoints.py on an interactive GPU cluster (the CLI vLLM
+# eval was removed; it fails the OpenSSL FIPS self-test on serverless GPU workers).
+
+# MLflow experiment name — this is air's `experiment_name`, which becomes part of
+# the Jobs API task key, so it must be a SLUG: alphanumerics, hyphens, underscores
+# only (NO slashes or dots). air creates/selects this experiment and sets
+# MLFLOW_RUN_ID on the worker; Axolotl inherits that run, so all metrics land here.
+mlflow_experiment: qwen-ft-sweep
+
+# UC Volume dir that holds train.jsonl / val.jsonl (written by 00_prep_data.py)
+# and receives per-run checkpoints under out/<run-tag>/.
+data_dir: /Volumes/fins_genai/fine_tuning/training_data/qwen_sweep

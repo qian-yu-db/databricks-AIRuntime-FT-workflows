@@ -1,0 +1,11 @@
+# air packages this dir as a tar snapshot and applies .gitignore as tar-exclude
+# rules (see CLAUDE.md). Keep macOS/editor/Python junk OUT of the snapshot so the
+# worker's code_source is exactly the project tree. In particular, macOS xattr
+# metadata can materialise as `._*` AppleDouble entries on the Linux worker and
+# hijack $CODE_SOURCE_PATH — exclude them explicitly.
+._*
+.DS_Store
+*.swp
+*.swo
+__pycache__/
+*.pyc

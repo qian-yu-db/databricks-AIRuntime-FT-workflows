@@ -1,0 +1,5 @@
+# NOTE: air's snapshot applies .gitignore as tar-exclude rules, so we must NOT
+# ignore the generated *.yaml here — the training job reads them from the snapshot.
+# Only ignore Python bytecode.
+__pycache__/
+*.pyc

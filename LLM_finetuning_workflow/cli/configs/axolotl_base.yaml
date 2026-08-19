@@ -1,0 +1,92 @@
+# =============================================================================
+# Axolotl base recipe — Qwen3-8B, FULL-parameter fine-tuning (FSDP, 8xH100).
+#
+# This is the TEMPLATE. run_sweep.py copies it once per grid cell and overrides
+# exactly three fields: learning_rate, num_epochs, output_dir (+ mlflow_run_name).
+# It also stamps base_model from grid.yaml's `model:`. Do NOT hand-edit
+# learning_rate / num_epochs here — they are swept.
+#
+# Task: structured information extraction from title-insurance OCR text
+# (same task as the original Mistral-7B agency fine-tune).
+# =============================================================================
+
+base_model: Qwen/Qwen3-8B
+# Full fine-tune: no `adapter:` key (that would make it LoRA/QLoRA).
+
+# --- data ---------------------------------------------------------------------
+# JSONL written by 00_prep_data.py in ChatML form:
+#   {"messages":[{"role":"system",...},{"role":"user",...},{"role":"assistant",...}]}
+# type: chat_template makes Axolotl apply Qwen2.5's own chat template and mask
+# the prompt so loss is computed on the assistant (extraction) turn only.
+datasets:
+  - path: PLACEHOLDER_TRAIN_JSONL      # overridden per-run (points at data_dir/train.jsonl)
+    type: chat_template
+    field_messages: messages
+
+test_datasets:
+  - path: PLACEHOLDER_VAL_JSONL        # overridden per-run (points at data_dir/val.jsonl)
+    type: chat_template
+    field_messages: messages
+    split: train                       # the val.jsonl file is itself the eval split
+
+chat_template: qwen3
+
+# --- sequence handling --------------------------------------------------------
+sequence_len: 8192            # axolotl DROPS (not truncates) docs > this; corpus median ~6k tokens, so 2048 emptied the dataset
+sample_packing: true          # pack short docs together -> better GPU utilisation
+pad_to_sequence_len: true
+
+# --- SWEPT (placeholders; run_sweep.py overrides both) ------------------------
+learning_rate: PLACEHOLDER_LR
+num_epochs: PLACEHOLDER_EPOCHS
+
+# --- fixed training hyperparameters -------------------------------------------
+micro_batch_size: 1
+gradient_accumulation_steps: 8        # effective batch = 8 (1 GPU)
+optimizer: adamw_torch
+lr_scheduler: cosine
+warmup_ratio: 0.03
+weight_decay: 0.0
+
+# --- precision / memory (full FT on 8xH100 via FSDP) --------------------------
+bf16: true
+tf32: true
+flash_attention: false        # flash-attn omitted from deps (won't build under uv isolation); SDPA is used instead
+gradient_checkpointing: true
+
+# --- FSDP (full-parameter shard across the 8 GPUs) ----------------------------
+# Required for an 8B full fine-tune: the model + optimizer state won't fit on one
+# H100, so FULL_SHARD splits params/grads/optimizer across all ranks. Axolotl
+# reads this block AND accelerate_fsdp.yaml (the launcher) must agree on the wrap
+# class (Qwen3DecoderLayer). run_sweep.py emits `accelerate launch` when
+# num_accelerators > 1 so this config is actually used.
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: Qwen3DecoderLayer
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_offload_params: false
+  fsdp_use_orig_params: true
+
+# --- output -------------------------------------------------------------------
+output_dir: PLACEHOLDER_OUTPUT_DIR    # overridden per-run -> data_dir/out/<run-tag>
+
+# --- logging / eval / checkpoints ---------------------------------------------
+logging_steps: 10
+eval_strategy: epoch
+save_strategy: epoch
+save_total_limit: 1                   # keep only best/last to save UC Volume space
+
+# --- MLflow (native Axolotl integration) --------------------------------------
+# air creates the experiment (from its experiment_name) and exports MLFLOW_RUN_ID
+# on the worker, which Axolotl inherits. So we deliberately do NOT set
+# mlflow_experiment_name here — setting it would fork a second experiment.
+use_mlflow: true
+mlflow_tracking_uri: databricks
+mlflow_run_name: PLACEHOLDER_RUN_NAME  # overridden per-run -> lr<..>_ep<..>
+
+special_tokens:
+  pad_token: "<|endoftext|>"
