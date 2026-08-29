@@ -1,0 +1,48 @@
+# =============================================================================
+# AI Runtime CLI registration job spec — registers ONE swept checkpoint to the UC
+# Model Registry as a vLLM-served ChatModel. run_sweep.py --register --only <tag>
+# fills the placeholders and submits it; you normally never call `air run` on this
+# file directly.
+#
+# Runs on GPU_1xH100 + databricks_ai_v5 because mlflow.register_model(env_pack=...)
+# packages this worker's environment (vLLM/CUDA) into the model version and tars
+# ~16 GB of weights — that needs the worker's RAM and the fuller image. It does NOT
+# use the GPU for compute; the GPU worker is just where the weights + env live.
+#
+# PREREQUISITES:
+#   - air >= 1.1.0 (named image version)
+#   - databricks-sdk >= 0.102.0 (older has a 5-min upload timeout that fails on the
+#     ~16 GB env_pack tar) — pinned in dependencies below.
+#
+# Registration only: this logs + registers a new UC version. It does NOT create a
+# serving endpoint (that's a separate, explicit step).
+# =============================================================================
+
+experiment_name: PLACEHOLDER_MLFLOW_EXPERIMENT   # e.g. qwen-ft-sweep (air's slug)
+mlflow_run_name: PLACEHOLDER_RUN_NAME            # e.g. register_lr1e-5_ep4
+
+environment:
+  version: 'databricks_ai_v5'      # fuller image (vLLM present, FIPS-clean); NOT '5'.
+  dependencies:
+    - "vllm==0.11.2"
+    - "transformers==4.57.6"
+    - "mlflow"
+    - "databricks-sdk>=0.102.0"
+
+compute:
+  num_accelerators: 1
+  accelerator_type: GPU_1xH100
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: PLACEHOLDER_ROOT_PATH             # abs path to cli/ (run_sweep.py fills this)
+
+# run_sweep.py OVERWRITES this command per-run: the shared $CODE resolver (AppleDouble
+# `._` workaround) + register_model.py with --checkpoints-dir, --tag, --uc-model-name.
+# For a MANUAL run, replace the placeholders below.
+command: |
+  python -u $CODE_SOURCE_PATH/scripts/register_model.py --checkpoints-dir PLACEHOLDER_CHECKPOINTS_DIR --tag PLACEHOLDER_TAG --uc-model-name PLACEHOLDER_UC_MODEL
+
+max_retries: 0
+timeout_minutes: 60

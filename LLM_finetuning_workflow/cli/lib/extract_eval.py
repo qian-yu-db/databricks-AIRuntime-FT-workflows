@@ -12,6 +12,7 @@ Two scoring conventions live here on purpose; do NOT cross-compare their F1:
 
 import difflib
 import json
+import re
 
 # Values treated as "not present" on either side.
 _NA_VALUES = ("", "NA", "N/A")
@@ -22,11 +23,41 @@ def strip_inst(text):
     """Remove any leading [INST] / trailing [/INST] Mistral markers. Idempotent."""
     if text is None:
         return text
-    import re
-
     t = str(text).strip()
     t = re.sub(r"^\s*\[INST\]\s*", "", t)
     t = re.sub(r"\s*\[/INST\]\s*$", "", t)
+    return t.strip()
+
+
+# --- Response normalization --------------------------------------------------
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def clean_response(text):
+    """Normalize a served Qwen3 completion to bare JSON text for `parse_json`.
+
+    Qwen3's chat template opens a `<think>` block in the PROMPT whenever thinking
+    is enabled (the vLLM OpenAI server's default — it doesn't pass
+    `enable_thinking=false`). The served completion then looks like
+    `…reasoning…</think>\\n\\n{json}` (or a full `<think>…</think>{json}` when the
+    open tag is echoed), which `json.loads` rejects → the doc scores as all-FN.
+    We also strip ```json / ``` markdown fences. Idempotent; safe on clean JSON.
+
+    NOTE: this is the reliable fix for the reasoning leak. Patching
+    `chat_template.jinja` is unreliable — Qwen3's real template guards the empty
+    think block with `{%- else %}` (not `{%- endif %}`), so the notebooks'
+    `patch_chat_template()` string-replace is a no-op on these checkpoints.
+    """
+    if text is None:
+        return ""
+    t = str(text)
+    # Drop any complete <think>…</think> block.
+    t = _THINK_BLOCK_RE.sub("", t)
+    # If a lone closing </think> remains (the opening tag lived in the prompt, not
+    # the completion), keep only what follows the last one.
+    if "</think>" in t:
+        t = t.rsplit("</think>", 1)[-1]
+    t = t.replace("```json", "").replace("```", "")
     return t.strip()
 
 
