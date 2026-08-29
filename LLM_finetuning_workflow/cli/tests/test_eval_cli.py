@@ -6,6 +6,8 @@ request from only the system+user turns, applies clean_response to the completio
 and returns the held-out assistant turn as ground truth — and that the shared
 scoring helpers are the very ones from extract_eval (not a drifting copy).
 """
+import sys
+import types
 from types import SimpleNamespace
 
 import extract_eval
@@ -80,3 +82,62 @@ def test_run_inference_records_errors_without_raising(monkeypatch):
     ]}]
     preds, errs = eval_cli.run_inference(records, max_new_tokens=16, max_workers=1)
     assert preds == [] and errs == [0]
+
+
+# --- build_scored: errored docs count as FN (fix: don't drop them, don't inflate F1) -
+def test_build_scored_counts_errored_docs_as_false_negatives():
+    records = [
+        {"file_name": "d0", "messages": [
+            {"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+            {"role": "assistant", "content": '{"A": "1"}'}]},
+        {"file_name": "d1", "messages": [
+            {"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+            {"role": "assistant", "content": '{"B": "2"}'}]},
+    ]
+    preds = [{"file_name": "d0", "pred": '{"A": "1"}', "ground_truth": '{"A": "1"}'}]
+    scored = eval_cli.build_scored(preds, [1], records)     # record 1 errored
+
+    assert len(scored) == 2
+    errored = next(s for s in scored if s["file_name"] == "d1")
+    assert errored["pred"] == ""                            # empty -> parses to {} -> FN
+    assert errored["ground_truth"] == '{"B": "2"}'
+
+    r = extract_eval.score(scored)
+    # d0 is a TP, d1 (errored) is an FN — recall 0.5, NOT the inflated 1.0 you'd get
+    # from scoring only the successful preds.
+    assert r["tp"] == 1 and r["fn"] == 1
+
+
+# --- evaluate_tags: one failing checkpoint is skipped, not fatal to the batch -------
+def _fake_mlflow():
+    m = types.ModuleType("mlflow")
+    m.set_experiment = lambda e: None
+
+    class _Run:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    m.start_run = lambda run_name=None: _Run()
+    m.log_param = lambda *a, **k: None
+    m.set_tags = lambda *a, **k: None
+    m.log_metrics = lambda *a, **k: None
+    return m
+
+
+def test_evaluate_tags_skips_failing_checkpoint(monkeypatch):
+    monkeypatch.setitem(sys.modules, "mlflow", _fake_mlflow())
+
+    def fake_eval_one(tag, ckpt, records, args):
+        if tag == "bad":
+            raise RuntimeError("vLLM did not become ready")
+        return ({"f1": 0.9, "precision": 0.9, "recall": 0.9}, {"f1": 0.8}, 10, 0)
+
+    monkeypatch.setattr(eval_cli, "eval_one", fake_eval_one)
+    args = SimpleNamespace(experiment="/Users/me@databricks.com/exp")
+    summary = eval_cli.evaluate_tags(["good1", "bad", "good2"], "/out", [], args)
+
+    by_tag = {s["tag"]: s for s in summary}
+    assert len(summary) == 3                       # all three attempted
+    assert by_tag["bad"]["failed"] is True         # failure recorded, not raised
+    assert not by_tag["good1"].get("failed")
+    assert by_tag["good2"]["all_f1"] == 0.9        # batch continued past 'bad'

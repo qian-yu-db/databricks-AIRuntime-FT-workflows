@@ -243,6 +243,18 @@ def test_run_eval_print_only_does_not_submit(monkeypatch, tmp_path, grid):
     assert rc == 0 and called["n"] == 0
 
 
+def test_run_eval_guards_missing_checkpoint(monkeypatch, tmp_path, grid):
+    # --eval --only <tag> for a checkpoint not on the Volume should fail locally,
+    # not spin up a GPU worker (mirrors run_register's guard).
+    monkeypatch.setattr(run_sweep, "GENERATED", tmp_path)
+    monkeypatch.setattr(run_sweep, "completed_tags", lambda g, p: {"lr1e-5_ep5"})
+    submitted = {"n": 0}
+    monkeypatch.setattr(run_sweep, "submit",
+                        lambda *a: submitted.__setitem__("n", submitted["n"] + 1) or 0)
+    rc = run_sweep.run_eval(grid, _eval_args(only="lr1e-5_ep4", dry_run=False))
+    assert rc == 1 and submitted["n"] == 0
+
+
 # --- register spec renderer + run_register orchestration ---------------------
 def test_render_register_air_config(tmp_path, monkeypatch, grid):
     monkeypatch.setattr(run_sweep, "GENERATED", tmp_path)
@@ -258,6 +270,15 @@ def test_render_register_air_config(tmp_path, monkeypatch, grid):
     assert f"--checkpoints-dir {g['checkpoints_dir']}" in cmd
     assert "--tag lr1e-5_ep4" in cmd
     assert "--uc-model-name cat.sch.mymodel" in cmd
+
+
+def test_main_only_no_match_exits(monkeypatch, grid):
+    # A --only tag that isn't a grid cell must fail loudly, not be a silent no-op.
+    monkeypatch.setattr(run_sweep, "load_grid", lambda: grid)
+    monkeypatch.setattr(sys, "argv", ["run_sweep.py", "--only", "nope_ep9", "--print-only"])
+    with pytest.raises(SystemExit) as ei:
+        run_sweep.main()
+    assert ei.value.code == 2
 
 
 def test_run_register_requires_registered_model(grid):

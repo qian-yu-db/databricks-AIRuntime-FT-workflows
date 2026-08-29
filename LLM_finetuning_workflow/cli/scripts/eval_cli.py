@@ -134,6 +134,19 @@ def run_inference(records, max_new_tokens, max_workers=4):
     return preds, errs
 
 
+def build_scored(preds, err_indices, records):
+    """The list handed to score(): successful preds PLUS one empty-prediction
+    placeholder per errored doc, so failed inferences count as false negatives
+    instead of being dropped (dropping them shrinks the denominator and inflates F1,
+    which could let a flaky checkpoint win --pick-best). `err_indices` index `records`.
+    """
+    return list(preds) + [
+        {"file_name": records[i].get("file_name"), "pred": "",
+         "ground_truth": records[i]["messages"][-1]["content"]}
+        for i in err_indices
+    ]
+
+
 def eval_one(tag, ckpt, records, args):
     """Serve, infer, score one checkpoint. Returns the MLflow-loggable metrics dict."""
     workdir = tempfile.mkdtemp()
@@ -153,12 +166,13 @@ def eval_one(tag, ckpt, records, args):
             stop_vllm(proc)
             print("vLLM stopped.")
 
-    if not preds:
-        raise RuntimeError(f"{tag}: no predictions — every inference request failed.")
+    if not preds and not errs:
+        raise RuntimeError(f"{tag}: empty test set — nothing to score.")
 
-    overall = score(preds)
-    top8 = score(preds, TOP_8_FIELDS)
-    print(f"  ALL : {overall}")
+    scored = build_scored(preds, errs, records)   # errored docs count as FN
+    overall = score(scored)
+    top8 = score(scored, TOP_8_FIELDS)
+    print(f"  ALL : {overall}   ({len(preds)} ok, {len(errs)} errored -> FN)")
     print(f"  TOP8: {top8}")
     return overall, top8, len(preds), len(errs)
 
@@ -172,7 +186,7 @@ def main():
     ap.add_argument("--experiment", required=True,
                     help="MLflow experiment ABSOLUTE path, e.g. /Users/you@databricks.com/qwen-ft-sweep")
     ap.add_argument("--tag", default=None,
-                    help="single checkpoint tag under out/; omit to evaluate ALL checkpoints")
+                    help="single checkpoint tag under --checkpoints-dir; omit to evaluate ALL")
     ap.add_argument("--test-jsonl", default=None, help="override; default <data-dir>/test.jsonl")
     ap.add_argument("--max-new-tokens", type=int, default=3500)
     ap.add_argument("--max-model-len", type=int, default=32768)
@@ -193,13 +207,44 @@ def main():
     print(f"Will evaluate: {tags}")
     assert tags, f"No checkpoints found under {out_dir}"
 
+    summary = evaluate_tags(tags, out_dir, records, args)
+
+    print("\n=== Eval summary ===")
+    for s in sorted(summary, key=lambda x: x["all_f1"] if x["all_f1"] == x["all_f1"] else -1.0,
+                    reverse=True):
+        if s.get("failed"):
+            print(f"  {s['tag']}: FAILED (see log above)")
+        else:
+            print(f"  {s['tag']}: all_f1={s['all_f1']:.4f} top8_f1={s['top8_f1']:.4f} "
+                  f"({s['docs']} docs, {s['errors']} errors)")
+
+    n_ok = sum(1 for s in summary if not s.get("failed"))
+    n_failed = len(summary) - n_ok
+    print(f"\nLogged {n_ok} eval run(s) to MLflow experiment {args.experiment}"
+          + (f"; {n_failed} checkpoint(s) FAILED" if n_failed else ""))
+    # Non-zero only if EVERY checkpoint failed, so `air` flags a wholly-failed job
+    # while a partial batch (some evals logged) still succeeds.
+    return 1 if n_failed and n_ok == 0 else 0
+
+
+def evaluate_tags(tags, out_dir, records, args):
+    """Eval each tag, logging one stage=eval MLflow run per success. A checkpoint that
+    fails (vLLM won't serve, weights missing, all requests error) is logged to stdout
+    and SKIPPED — one bad checkpoint must not abort a bare-`--eval` batch of many.
+    Returns a per-tag summary (failed entries carry {"failed": True})."""
     import mlflow
     mlflow.set_experiment(args.experiment)
 
     summary = []
     for tag in tags:
         ckpt = os.path.join(out_dir, tag)
-        overall, top8, n_ok, n_err = eval_one(tag, ckpt, records, args)
+        try:
+            overall, top8, n_ok, n_err = eval_one(tag, ckpt, records, args)
+        except Exception as e:
+            print(f"  ! {tag}: eval FAILED ({e}) — skipping to the next checkpoint.")
+            summary.append({"tag": tag, "all_f1": float("nan"), "top8_f1": float("nan"),
+                            "docs": 0, "errors": 0, "failed": True})
+            continue
         with mlflow.start_run(run_name=f"eval_{tag}"):
             mlflow.log_param("model_path", ckpt)
             mlflow.log_param("checkpoint_tag", tag)
@@ -208,13 +253,8 @@ def main():
             mlflow.log_metrics({f"top8_{k}": v for k, v in top8.items()})
         summary.append({"tag": tag, "all_f1": overall["f1"], "top8_f1": top8["f1"],
                         "docs": n_ok, "errors": n_err})
-
-    print("\n=== Eval summary ===")
-    for s in sorted(summary, key=lambda x: x["all_f1"], reverse=True):
-        print(f"  {s['tag']}: all_f1={s['all_f1']:.4f} top8_f1={s['top8_f1']:.4f} "
-              f"({s['docs']} docs, {s['errors']} errors)")
-    print(f"\nLogged {len(summary)} eval run(s) to MLflow experiment {args.experiment}")
+    return summary
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

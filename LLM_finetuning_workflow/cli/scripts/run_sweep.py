@@ -13,12 +13,12 @@ Run from your laptop (not on Databricks), from the repo root:
     python scripts/run_sweep.py --profile e2_demo_fieldeng                     # train full grid (8xH100)
     python scripts/run_sweep.py --profile e2_demo_fieldeng --serialize-start   # train, throttled (one cell into the GPU at a time)
     python scripts/run_sweep.py --profile e2_demo_fieldeng --dry-run           # generate + validate only
-    python scripts/run_sweep.py --profile e2_demo_fieldeng --only lr2e-06_ep5  # one cell
+    python scripts/run_sweep.py --profile e2_demo_fieldeng --only lr1e-5_ep4   # one cell
     python scripts/run_sweep.py --profile e2_demo_fieldeng --status            # per-cell checkpoint status (local, no GPU)
     python scripts/run_sweep.py --profile e2_demo_fieldeng --resume            # (re)submit only cells missing a checkpoint
     python scripts/run_sweep.py --profile e2_demo_fieldeng --resume --serialize-start  # resume, throttled
     python scripts/run_sweep.py --profile e2_demo_fieldeng --eval              # eval ALL checkpoints (one 1xH100 job)
-    python scripts/run_sweep.py --profile e2_demo_fieldeng --eval --only lr2e-06_ep5  # eval one checkpoint
+    python scripts/run_sweep.py --profile e2_demo_fieldeng --eval --only lr1e-5_ep4  # eval one checkpoint
     python scripts/run_sweep.py --profile e2_demo_fieldeng --pick-best         # rank eval runs by F1 (local, no GPU)
     python scripts/run_sweep.py --profile e2_demo_fieldeng --register --only lr1e-5_ep4  # register that checkpoint to UC
 
@@ -275,6 +275,18 @@ def run_eval(grid: dict, args):
         return 1
 
     tag = args.only or None
+
+    # Guard a single-cell eval the same way run_register does: fail locally if the
+    # checkpoint isn't on the Volume, instead of spinning up a GPU worker that dies in
+    # shutil.copytree. completed_tags returns empty on any CLI error, so we don't block
+    # then. Bare --eval (all) needs no guard — eval_cli discovers what exists.
+    if tag and not args.dry_run and not args.print_only:
+        done = completed_tags(grid, args.profile)
+        if done and tag not in done:
+            print(f"Checkpoint '{tag}' has no saved <checkpoints_dir>/{tag}/ on the Volume "
+                  f"(found: {', '.join(sorted(done))}). Nothing to eval.", file=sys.stderr)
+            return 1
+
     name = tag or "all"
     scope = f"checkpoint '{tag}'" if tag else "ALL checkpoints under checkpoints_dir"
     print(f"Mode: EVAL  |  {scope}  |  GPU_1xH100 (databricks_ai_v5)")
@@ -482,7 +494,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", default="", help="Databricks CLI profile")
     ap.add_argument("--dry-run", action="store_true", help="generate + `air run --dry-run` (no GPU spend)")
-    ap.add_argument("--only", default="", help="submit only this run tag, e.g. lr2e-06_ep5")
+    ap.add_argument("--only", default="", help="submit only this run tag, e.g. lr1e-5_ep4")
     ap.add_argument("--watch", action="store_true", help="stream logs inline (air run --watch); best with --only")
     ap.add_argument("--idem-suffix", default="", help="append to the idempotency key to force a fresh run (e.g. v2) after a failed cell")
     ap.add_argument("--print-only", action="store_true", help="generate configs, do not call air")
@@ -534,6 +546,13 @@ def main():
     print(f"Mode: TRAIN  |  Model: {grid['model']}  |  {grid['accelerator_type']} x{grid['num_accelerators']}")
     if args.serialize_start and not (args.dry_run or args.print_only):
         print(f"Throttle: serialized start, cap {args.max_active} active run(s).")
+
+    # A --only tag that matches no grid cell would otherwise submit nothing and look
+    # like a successful no-op; catch the typo instead.
+    if args.only and args.only not in {t for _, _, t in all_cells}:
+        print(f"--only '{args.only}' matches no cell in the grid. Cells: "
+              f"{', '.join(t for _, _, t in all_cells)}", file=sys.stderr)
+        sys.exit(2)
 
     rc = 0
     for lr, epochs, tag in all_cells:

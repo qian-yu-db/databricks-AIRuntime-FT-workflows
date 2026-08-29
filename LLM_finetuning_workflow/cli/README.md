@@ -102,10 +102,10 @@ uv run --with pandas --with pyyaml python scripts/prep_data.py --input ~/data/ra
 python scripts/run_sweep.py --print-only
 
 # 2. Validate against the service without spending GPU (air run --dry-run)
-python scripts/run_sweep.py --profile fevm-classic-stable --dry-run --only lr2e-6_ep5
+python scripts/run_sweep.py --profile fevm-classic-stable --dry-run --only lr1e-5_ep4
 
 # 3. SMOKE-TEST ONE CELL first (real 8×H100) — prove the whole path before the full grid
-python scripts/run_sweep.py --profile fevm-classic-stable --only lr2e-6_ep5 --watch
+python scripts/run_sweep.py --profile fevm-classic-stable --only lr1e-5_ep4 --watch
 
 # 4. Full sweep. --serialize-start sends cells to the GPU one at a time — this is
 #    the recommended default (safe on any quota). Drop it only if you have enough
@@ -113,7 +113,7 @@ python scripts/run_sweep.py --profile fevm-classic-stable --only lr2e-6_ep5 --wa
 python scripts/run_sweep.py --profile fevm-classic-stable --serialize-start
 
 # 5. Evaluate all trained checkpoints — one GPU_1xH100 vLLM job scores every <checkpoints_dir>/<tag>.
-#    (Smoke-test one first: --eval --only lr2e-6_ep5 --watch.)
+#    (Smoke-test one first: --eval --only lr1e-5_ep4 --watch.)
 python scripts/run_sweep.py --profile fevm-classic-stable --eval
 
 # 6. Rank the eval runs by F1 and print the winner (local MLflow query, no GPU).
