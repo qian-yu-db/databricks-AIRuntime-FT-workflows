@@ -171,27 +171,35 @@ assert experiment, f"Experiment '{EXPERIMENT_PATH}' not found — has the sweep 
 runs_df = mlflow.search_runs(
     experiment_ids=[experiment.experiment_id],
     filter_string="tags.stage = 'eval'",
-    order_by=["metrics.all_f1 DESC"],
 )
 
 if runs_df.empty:
     print("No eval runs found yet. Ensure the sweep job's eval task has completed.")
 else:
+    # Keep only the LATEST eval per checkpoint_tag. Re-running a cell appends a NEW
+    # stage=eval run rather than replacing the old one, so ranking by max-F1 over all
+    # of them can crown a stale/superseded run. Sort newest-first, keep first per tag.
+    if "params.checkpoint_tag" in runs_df.columns and "start_time" in runs_df.columns:
+        runs_df = (runs_df.sort_values("start_time", ascending=False)
+                          .drop_duplicates(subset="params.checkpoint_tag", keep="first"))
+
     cols = ["run_id", "params.checkpoint_tag", "params.learning_rate", "params.num_epochs",
             "metrics.all_f1", "metrics.top8_f1", "metrics.all_precision", "metrics.all_recall"]
     # keep only columns that exist (some may be absent if the eval logs differently)
     cols = [c for c in cols if c in runs_df.columns]
     ranking = runs_df[cols].copy()
     ranking.columns = [c.split(".")[-1] for c in cols]  # strip prefix
-    ranking = ranking.sort_values("all_f1", ascending=False).reset_index(drop=True)
+    # Guard the sort: fall back gracefully if eval runs didn't surface all_f1.
+    if "all_f1" in ranking.columns:
+        ranking = ranking.sort_values("all_f1", ascending=False).reset_index(drop=True)
 
-    print("=== Sweep eval ranking (by all_f1) ===")
+    print("=== Sweep eval ranking (latest eval per tag, by all_f1) ===")
     display(spark.createDataFrame(ranking))
 
     best = ranking.iloc[0]
     print(f"\n🏆 Best checkpoint: {best.get('checkpoint_tag', 'N/A')}")
     print(f"   lr={best.get('learning_rate', '?')}, epochs={best.get('num_epochs', '?')}")
-    print(f"   all_f1={best['all_f1']:.4f}  top8_f1={best.get('top8_f1', 0):.4f}")
+    print(f"   all_f1={best.get('all_f1', float('nan')):.4f}  top8_f1={best.get('top8_f1', 0):.4f}")
     print(f"   Model path: /Volumes/fins_genai/fine_tuning/checkpoints/agency-ft-final-{best.get('checkpoint_tag', '')}")
 
 # COMMAND ----------

@@ -318,7 +318,7 @@ def test_pick_best_looks_up_by_absolute_path(monkeypatch, grid):
         rec["looked_up"] = name
         return SimpleNamespace(experiment_id="123")
 
-    def _search(experiment_ids, filter_string, order_by):
+    def _search(experiment_ids, filter_string, **kwargs):
         rec["filter"] = filter_string
         return pd.DataFrame({
             "params.checkpoint_tag": ["lr1e-5_ep4"],
@@ -334,3 +334,54 @@ def test_pick_best_looks_up_by_absolute_path(monkeypatch, grid):
     assert rc == 0
     assert rec["looked_up"] == grid["mlflow_experiment_path"]   # absolute path, not the slug
     assert "stage" in rec["filter"]
+
+
+def test_pick_best_keeps_latest_eval_per_tag(monkeypatch, grid, capsys):
+    """R2: rank the LATEST eval per tag, not the max F1 over all runs. An older,
+    higher-F1 eval of a tag must NOT beat that tag's newer, lower eval."""
+    pd = pytest.importorskip("pandas")
+
+    fake = types.ModuleType("mlflow")
+    fake.set_tracking_uri = lambda uri: None
+    fake.get_experiment_by_name = lambda name: SimpleNamespace(experiment_id="1")
+
+    def _search(experiment_ids, filter_string, **kwargs):
+        # lrX evaluated twice: stale 0.90 (older) then 0.30 (newest); lrY once at 0.50.
+        return pd.DataFrame({
+            "params.checkpoint_tag": ["lrX", "lrX", "lrY"],
+            "start_time": pd.to_datetime(["2026-08-01", "2026-08-29", "2026-08-10"]),
+            "metrics.all_f1": [0.90, 0.30, 0.50],
+            "metrics.top8_f1": [0.90, 0.30, 0.50],
+        })
+
+    fake.search_runs = _search
+    monkeypatch.setitem(sys.modules, "mlflow", fake)
+
+    rc = run_sweep.pick_best(grid, "prof")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "2 of 3 runs" in out                 # 3 runs collapsed to 2 tags
+    # latest-per-tag = {lrX: 0.30, lrY: 0.50} -> lrY wins. Without the dedup, the stale
+    # lrX@0.90 would be the global max and win instead.
+    assert "Winner: lrY" in out
+    assert "Winner: lrX" not in out
+
+
+def test_pick_best_tolerates_missing_all_f1_column(monkeypatch, grid):
+    """The F1 sort must be guarded: an eval-run set with no metrics.all_f1 column
+    should not crash pick_best (regression from dropping the tolerant server-side
+    order_by)."""
+    pd = pytest.importorskip("pandas")
+
+    fake = types.ModuleType("mlflow")
+    fake.set_tracking_uri = lambda uri: None
+    fake.get_experiment_by_name = lambda name: SimpleNamespace(experiment_id="1")
+    fake.search_runs = lambda experiment_ids, filter_string, **kw: pd.DataFrame({
+        "params.checkpoint_tag": ["lrX", "lrY"],
+        "start_time": pd.to_datetime(["2026-08-01", "2026-08-02"]),
+        # no metrics.all_f1 column at all
+    })
+    monkeypatch.setitem(sys.modules, "mlflow", fake)
+
+    rc = run_sweep.pick_best(grid, "prof")      # must not raise KeyError
+    assert rc == 0
