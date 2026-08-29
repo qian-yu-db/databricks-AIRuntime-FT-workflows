@@ -10,6 +10,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
 import extract_eval
 import eval_cli
 
@@ -141,3 +143,30 @@ def test_evaluate_tags_skips_failing_checkpoint(monkeypatch):
     assert by_tag["bad"]["failed"] is True         # failure recorded, not raised
     assert not by_tag["good1"].get("failed")
     assert by_tag["good2"]["all_f1"] == 0.9        # batch continued past 'bad'
+
+
+def test_evaluate_tags_lets_programming_errors_propagate(monkeypatch):
+    # A KeyError/AttributeError is a bug, not a checkpoint failure — it must crash,
+    # not be swallowed as a skipped checkpoint (narrowed except: RuntimeError/OSError).
+    monkeypatch.setitem(sys.modules, "mlflow", _fake_mlflow())
+
+    def bug(*a):
+        raise KeyError("regression")
+
+    monkeypatch.setattr(eval_cli, "eval_one", bug)
+    args = SimpleNamespace(experiment="/Users/me@databricks.com/exp")
+    with pytest.raises(KeyError):
+        eval_cli.evaluate_tags(["x"], "/out", [], args)
+
+
+def test_eval_one_hard_fails_when_all_inference_errors(monkeypatch):
+    # Total inference failure (preds empty) is not evaluable — raise so evaluate_tags
+    # skips it, rather than logging a spurious f1=0 run.
+    monkeypatch.setattr(eval_cli.shutil, "copytree", lambda *a, **k: None)
+    monkeypatch.setattr(eval_cli, "start_vllm", lambda *a, **k: object())
+    monkeypatch.setattr(eval_cli, "stop_vllm", lambda p: None)
+    monkeypatch.setattr(eval_cli, "run_inference", lambda records, mnt, mw: ([], [0, 1]))
+    args = SimpleNamespace(max_model_len=1024, gpu_memory_util=0.9, startup_timeout=1,
+                           max_new_tokens=1, max_workers=1)
+    with pytest.raises(RuntimeError, match="no successful predictions"):
+        eval_cli.eval_one("bad", "/ckpt", [{}, {}], args)

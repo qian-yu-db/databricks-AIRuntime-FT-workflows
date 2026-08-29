@@ -166,10 +166,15 @@ def eval_one(tag, ckpt, records, args):
             stop_vllm(proc)
             print("vLLM stopped.")
 
-    if not preds and not errs:
-        raise RuntimeError(f"{tag}: empty test set — nothing to score.")
+    if not preds:
+        # No successful inferences at all (vLLM served but every request failed, or an
+        # empty test set) — not a quality signal, so hard-fail the checkpoint rather
+        # than log a spurious f1=0 run. evaluate_tags catches this and skips it.
+        raise RuntimeError(f"{tag}: no successful predictions ({len(errs)} errored) — "
+                           "checkpoint not evaluable.")
 
-    scored = build_scored(preds, errs, records)   # errored docs count as FN
+    # PARTIAL errors count as FN so the F1 stays honest (see build_scored).
+    scored = build_scored(preds, errs, records)
     overall = score(scored)
     top8 = score(scored, TOP_8_FIELDS)
     print(f"  ALL : {overall}   ({len(preds)} ok, {len(errs)} errored -> FN)")
@@ -240,7 +245,10 @@ def evaluate_tags(tags, out_dir, records, args):
         ckpt = os.path.join(out_dir, tag)
         try:
             overall, top8, n_ok, n_err = eval_one(tag, ckpt, records, args)
-        except Exception as e:
+        except (RuntimeError, OSError) as e:
+            # Operational failures only (vLLM won't start, weights missing,
+            # all-requests-failed). Programming errors (KeyError, etc.) propagate so
+            # they surface as a crash instead of being silently logged as "failed".
             print(f"  ! {tag}: eval FAILED ({e}) — skipping to the next checkpoint.")
             summary.append({"tag": tag, "all_f1": float("nan"), "top8_f1": float("nan"),
                             "docs": 0, "errors": 0, "failed": True})

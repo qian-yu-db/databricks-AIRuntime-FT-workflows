@@ -149,6 +149,22 @@ def active_run_count(profile: str) -> int:
         return -1
 
 
+def require_checkpoint(grid: dict, tag: str, profile: str, action: str) -> bool:
+    """True if `tag` has a saved checkpoint on the Volume (safe to submit an --only
+    job for it); prints a message and returns False otherwise. Shared by --eval and
+    --register. completed_tags returns empty on any CLI error, so an unreadable
+    listing does NOT block — we'd rather let the worker fail fast than false-reject
+    on transient CLI/network trouble. Unlike train's grid-membership check, this only
+    asks whether the checkpoint EXISTS, so eval/register can target a tag from an
+    earlier sweep."""
+    done = completed_tags(grid, profile)
+    if done and tag not in done:
+        print(f"Checkpoint '{tag}' has no saved <checkpoints_dir>/{tag}/ on the Volume "
+              f"(found: {', '.join(sorted(done))}). Nothing to {action}.", file=sys.stderr)
+        return False
+    return True
+
+
 def render_axolotl_config(grid: dict, lr: float, epochs: int, tag: str) -> Path:
     """Copy axolotl_base.yaml and override the 3 per-run fields."""
     with open(CONFIGS / "axolotl_base.yaml") as f:
@@ -276,15 +292,11 @@ def run_eval(grid: dict, args):
 
     tag = args.only or None
 
-    # Guard a single-cell eval the same way run_register does: fail locally if the
-    # checkpoint isn't on the Volume, instead of spinning up a GPU worker that dies in
-    # shutil.copytree. completed_tags returns empty on any CLI error, so we don't block
-    # then. Bare --eval (all) needs no guard — eval_cli discovers what exists.
+    # Guard a single-cell eval: fail locally if the checkpoint isn't on the Volume,
+    # instead of spinning up a GPU worker that dies in shutil.copytree. Bare --eval
+    # (all) needs no guard — eval_cli discovers what exists.
     if tag and not args.dry_run and not args.print_only:
-        done = completed_tags(grid, args.profile)
-        if done and tag not in done:
-            print(f"Checkpoint '{tag}' has no saved <checkpoints_dir>/{tag}/ on the Volume "
-                  f"(found: {', '.join(sorted(done))}). Nothing to eval.", file=sys.stderr)
+        if not require_checkpoint(grid, tag, args.profile, "eval"):
             return 1
 
     name = tag or "all"
@@ -355,13 +367,9 @@ def run_register(grid: dict, args):
         return 1
 
     # Guard: the checkpoint must exist on the Volume (register_model reads
-    # <checkpoints_dir>/<tag>/). completed_tags returns empty on any CLI error,
-    # in which case we don't block.
+    # <checkpoints_dir>/<tag>/).
     if not args.dry_run and not args.print_only:
-        done = completed_tags(grid, args.profile)
-        if done and tag not in done:
-            print(f"Checkpoint '{tag}' has no saved <checkpoints_dir>/{tag}/ on the Volume "
-                  f"(found: {', '.join(sorted(done))}). Nothing to register.", file=sys.stderr)
+        if not require_checkpoint(grid, tag, args.profile, "register"):
             return 1
 
     print(f"Mode: REGISTER  |  checkpoint '{tag}' -> {grid['registered_model']}  |  GPU_1xH100")
