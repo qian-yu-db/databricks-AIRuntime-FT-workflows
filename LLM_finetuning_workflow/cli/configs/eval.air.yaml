@@ -1,0 +1,62 @@
+# =============================================================================
+# AI Runtime CLI eval job spec — the vLLM local-eval counterpart of train.air.yaml.
+#
+# This is the PER-EVAL template. run_sweep.py --eval fills in the placeholders and
+# submits it (one job that evals ALL checkpoints under out/, or a single --only
+# <tag>). You normally never call `air run` on this file directly — run_sweep.py
+# does it for you — but you can, for a single manual eval, by replacing the
+# PLACEHOLDER_* values yourself.
+#
+# THE ONE THING THAT MAKES CLI eval work on a FIPS-hardened workspace:
+#
+#     environment.version: databricks_ai_v5   (NOT '5')
+#
+# `databricks_ai_v5` is the fuller image; it PREINSTALLS opencv 4.12.0 whose
+# vendored libcrypto is `.so.1.1` — FIPS-clean — instead of the pip-pulled opencv
+# on version `5` that vendors OpenSSL 1.1.1k and aborts vLLM's model-inspection
+# subprocess on FIPS-hardened serverless GPU workers. The eval deps below (vllm +
+# transformers + mlflow) do NOT reinstall opencv, so the clean preinstalled 4.12.0
+# stays in place — do NOT add an opencv pin here. See the README section
+# "CLI vLLM eval on a FIPS workspace" for the full root cause.
+#
+# PREREQUISITE: air >= 1.1.0 (older air rejects named image versions with
+# "Version must be an integer"). Upgrade: `uv tool upgrade databricks-air`.
+#
+# Eval always runs on a single GPU (GPU_1xH100) regardless of the 8xH100 training
+# grid — run_sweep.py --eval hardcodes that; the placeholders below are only a
+# default for a manual `air run --file` invocation.
+# =============================================================================
+
+experiment_name: PLACEHOLDER_MLFLOW_EXPERIMENT   # e.g. qwen-ft-sweep (air's slug)
+mlflow_run_name: PLACEHOLDER_RUN_NAME            # e.g. cli_eval_lr2e-6_ep5
+
+environment:
+  version: 'databricks_ai_v5'      # the lever — see header. NOT '5'.
+  dependencies:
+    - "vllm==0.11.2"
+    - "transformers==4.57.6"
+    - "mlflow"
+
+compute:
+  num_accelerators: 1
+  accelerator_type: GPU_1xH100
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: PLACEHOLDER_ROOT_PATH             # abs path to cli/ (run_sweep.py fills this)
+
+# $CODE_SOURCE_PATH is where the snapshot lands. run_sweep.py OVERWRITES this
+# command per-eval: it prepends the shared $CODE resolver (the AppleDouble `._`
+# workaround) and calls scripts/eval_cli.py with --data-dir (test.jsonl),
+# --checkpoints-dir (the weights), an ABSOLUTE --experiment path, and (for a
+# single-cell eval) --tag. eval_cli.py imports lib/extract_eval.py from $CODE/lib.
+# For a MANUAL run, replace the placeholders:
+#   --data-dir <grid.yaml data_dir>  --checkpoints-dir <grid.yaml checkpoints_dir>
+#   --experiment <grid.yaml mlflow_experiment_path>
+#   [--tag <checkpoint tag>]   (drop --tag to eval every checkpoint under checkpoints_dir)
+command: |
+  python -u $CODE_SOURCE_PATH/scripts/eval_cli.py --data-dir PLACEHOLDER_DATA_DIR --checkpoints-dir PLACEHOLDER_CHECKPOINTS_DIR --experiment PLACEHOLDER_EXPERIMENT_PATH --tag PLACEHOLDER_TAG
+
+max_retries: 0
+timeout_minutes: 120

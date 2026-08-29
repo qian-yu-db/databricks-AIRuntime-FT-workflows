@@ -14,7 +14,7 @@ base_model: Qwen/Qwen3-8B
 # Full fine-tune: no `adapter:` key (that would make it LoRA/QLoRA).
 
 # --- data ---------------------------------------------------------------------
-# JSONL written by 00_prep_data.py in ChatML form:
+# JSONL written by scripts/prep_data.py in ChatML form:
 #   {"messages":[{"role":"system",...},{"role":"user",...},{"role":"assistant",...}]}
 # type: chat_template makes Axolotl apply Qwen2.5's own chat template and mask
 # the prompt so loss is computed on the assistant (extraction) turn only.

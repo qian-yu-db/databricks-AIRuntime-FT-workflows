@@ -9,3 +9,5 @@
 *.swo
 __pycache__/
 *.pyc
+.pytest_cache/
+_prep_out/

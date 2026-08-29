@@ -15,13 +15,10 @@ model: Qwen/Qwen3-8B
 # train -> eval -> pick-best flow cheaply before the full sweep. Restore the
 # commented values below for the real 4x2 = 8-cell run.
 learning_rates:
-  - 1.0e-6
-  - 2.0e-6
-  - 5.0e-6
+  - 2.0e-5
   - 1.0e-5
 
 epochs:
-  - 3
   - 4
   - 5
 
@@ -39,16 +36,36 @@ watch: false
 accelerator_type: GPU_8xH100
 num_accelerators: 8
 
-# Evaluation is NOT run by this driver — it's done in the notebook
-# notebooks/eval_sweep_checkpoints.py on an interactive GPU cluster (the CLI vLLM
-# eval was removed; it fails the OpenSSL FIPS self-test on serverless GPU workers).
+# Evaluation runs from this same driver: `run_sweep.py --eval` submits a CLI vLLM
+# eval on a GPU_1xH100 worker (configs/eval.air.yaml + scripts/eval_cli.py). It
+# works on FIPS-hardened serverless GPU because it pins environment.version:
+# databricks_ai_v5 (see the README "CLI vLLM eval on a FIPS workspace" section).
+# It logs stage=eval runs that `--pick-best` ranks.
 
 # MLflow experiment name — this is air's `experiment_name`, which becomes part of
 # the Jobs API task key, so it must be a SLUG: alphanumerics, hyphens, underscores
 # only (NO slashes or dots). air creates/selects this experiment and sets
-# MLFLOW_RUN_ID on the worker; Axolotl inherits that run, so all metrics land here.
+# MLFLOW_RUN_ID on the worker; Axolotl inherits that run, so all TRAIN metrics
+# land here. `--pick-best` finds the experiment by this slug.
 mlflow_experiment: qwen-ft-sweep
 
-# UC Volume dir that holds train.jsonl / val.jsonl (written by 00_prep_data.py)
-# and receives per-run checkpoints under out/<run-tag>/.
+# ABSOLUTE workspace path of that SAME experiment — required by `run_sweep.py
+# --eval`, because eval_cli.py logs via the MLflow API (which needs the full
+# /Users/<you>/... path, not the slug). Point it at the experiment the slug above
+# resolves to (air puts it under your home).
+mlflow_experiment_path: /Users/q.yu@databricks.com/qwen-ft-sweep
+
+# UC Volume dir that holds train.jsonl / val.jsonl / test.jsonl (written by
+# scripts/prep_data.py). DATA ONLY — checkpoints go to checkpoints_dir below.
 data_dir: /Volumes/fins_genai/fine_tuning/training_data/qwen_sweep
+
+# UC Volume dir that RECEIVES per-run checkpoints, one per cell at
+# <checkpoints_dir>/<run-tag>/. Kept separate from data_dir so model weights don't
+# clutter the training-data folder. run_sweep (train output_dir / --status / --resume),
+# eval_cli, and register_model all read/write checkpoints here.
+checkpoints_dir: /Volumes/fins_genai/fine_tuning/checkpoints/qwen_sweep
+
+# 3-level UC name for `run_sweep.py --register --only <tag>` (registers the chosen
+# checkpoint as a vLLM-served ChatModel, env_pack="databricks_model_serving").
+# catalog.schema.model — must be a Unity Catalog model name you can write to.
+registered_model: fins_genai.fine_tuning.qwen3_8b_agency_ft
