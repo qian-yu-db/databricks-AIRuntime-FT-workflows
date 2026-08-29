@@ -365,3 +365,23 @@ def test_pick_best_keeps_latest_eval_per_tag(monkeypatch, grid, capsys):
     # lrX@0.90 would be the global max and win instead.
     assert "Winner: lrY" in out
     assert "Winner: lrX" not in out
+
+
+def test_pick_best_tolerates_missing_all_f1_column(monkeypatch, grid):
+    """The F1 sort must be guarded: an eval-run set with no metrics.all_f1 column
+    should not crash pick_best (regression from dropping the tolerant server-side
+    order_by)."""
+    pd = pytest.importorskip("pandas")
+
+    fake = types.ModuleType("mlflow")
+    fake.set_tracking_uri = lambda uri: None
+    fake.get_experiment_by_name = lambda name: SimpleNamespace(experiment_id="1")
+    fake.search_runs = lambda experiment_ids, filter_string, **kw: pd.DataFrame({
+        "params.checkpoint_tag": ["lrX", "lrY"],
+        "start_time": pd.to_datetime(["2026-08-01", "2026-08-02"]),
+        # no metrics.all_f1 column at all
+    })
+    monkeypatch.setitem(sys.modules, "mlflow", fake)
+
+    rc = run_sweep.pick_best(grid, "prof")      # must not raise KeyError
+    assert rc == 0

@@ -417,19 +417,27 @@ def pick_best(grid: dict, profile: str):
     # Keep only the LATEST eval per checkpoint_tag. Re-evaluating a tag (e.g. `--eval
     # --only <tag>` run again, or an older pre-clean_response eval) APPENDS a new run
     # rather than replacing the old one; ranking by max-F1 over all of them can crown a
-    # stale/superseded run. Sort newest-first, keep the first row per tag. (Guarded:
-    # fall back to all runs if the expected columns are absent.)
+    # stale/superseded run. Sort newest-first, keep the first row per tag. Guarded:
+    # fall back to all runs if the expected columns are absent (and the header below
+    # says so). (Rows with a NaN checkpoint_tag collapse together, but our eval always
+    # logs a tag, and an untagged run isn't registerable anyway.)
     n_all = len(runs)
-    if "params.checkpoint_tag" in runs.columns and "start_time" in runs.columns:
+    deduped = "params.checkpoint_tag" in runs.columns and "start_time" in runs.columns
+    if deduped:
         runs = (runs.sort_values("start_time", ascending=False)
                     .drop_duplicates(subset="params.checkpoint_tag", keep="first"))
     n_tags = len(runs)
-    runs = runs.sort_values("metrics.all_f1", ascending=False)
+    # Guard the F1 sort too: some eval run sets may not surface metrics.all_f1, and
+    # `cols`/`best.get` below already treat it as optional.
+    if "metrics.all_f1" in runs.columns:
+        runs = runs.sort_values("metrics.all_f1", ascending=False)
 
     cols = [c for c in ["params.checkpoint_tag", "metrics.all_f1", "metrics.top8_f1",
                         "metrics.all_precision", "metrics.all_recall"] if c in runs.columns]
     table = runs[cols].rename(columns=lambda c: c.split(".")[-1])
-    print(f"\n=== Sweep eval ranking (latest eval per tag — {n_tags} of {n_all} runs) ===")
+    header = (f"latest eval per tag — {n_tags} of {n_all} runs" if deduped
+              else f"{n_all} eval runs (no checkpoint_tag/start_time to dedup)")
+    print(f"\n=== Sweep eval ranking ({header}) ===")
     print(table.to_string(index=False))
     best = table.iloc[0]
     print(f"\nWinner: {best.get('checkpoint_tag', '?')}  "
