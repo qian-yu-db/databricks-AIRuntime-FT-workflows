@@ -16,7 +16,7 @@ Worked examples for **full-parameter fine-tuning of an open LLM on Databricks AI
 .
 ├── LLM_finetuning_workflow/     # full-parameter fine-tuning — two interchangeable stacks
 │   ├── notebooks/               #   notebook-driven pipeline (TRL SFTTrainer + DeepSpeed ZeRO-3)
-│   └── cli/                     #   CLI-driven sweep via the `air` CLI (Axolotl full-FT + FSDP). This is WIP
+│   └── cli/                     #   CLI-driven, laptop end-to-end workflow via the `air` CLI (Axolotl full-FT + FSDP)
 └── LLM_serving_workflow/        # load-test & size a Model Serving endpoint for the fine-tuned model
 ```
 
@@ -36,11 +36,12 @@ Fine-tune Qwen3-8B with **full-parameter SFT** (no LoRA) on information extracti
   * Notebook 05 — Register & deploy the best model to a Model Serving endpoint
 
 
-- **[`LLM_finetuning_workflow/cli/`](LLM_finetuning_workflow/cli/README.md)** — a config-driven driven workflow running from users' laptop with the `air` CLI (**This is still WIP**):
-  
-  * `scripts/run_sweep.py` expands `configs/grid.yaml` and submits one `air run` per cell
-  * Training uses **Axolotl full-FT with FSDP across 8×H100**
-  * Evaluation is a notebook (vLLM on AI runtime cluster)
+- **[`LLM_finetuning_workflow/cli/`](LLM_finetuning_workflow/cli/README.md)** — a config-driven workflow that runs **end-to-end from your laptop** via the `air` CLI:
+
+  * `scripts/prep_data.py` — local raw CSV → ChatML JSONL → upload to the UC Volume (pure Python, no Spark)
+  * `scripts/run_sweep.py` expands `configs/grid.yaml` and submits one `air run` per cell; training uses **Axolotl full-FT with FSDP across 8×H100**
+  * `--eval` scores checkpoints with **local vLLM on AI Runtime (1×H100)**; `--pick-best` ranks by held-out F1
+  * `--register` registers the winning checkpoint to the **UC Model Registry** as a vLLM ChatModel
 
 ## Serving & load testing
 
