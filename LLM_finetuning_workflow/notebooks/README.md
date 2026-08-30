@@ -57,7 +57,7 @@ All notebooks expose `catalog`, `schema`, `volume`, and `volume_model` as **widg
 **Key steps:**
 1. Loads data in `.xlsx` format from the UC Volume
 2. Formats each example as a multi-turn chat (system + user + assistant) using Qwen3's chat template
-3. Splits into train (70%) / val (15%) / test (15%)
+3. Splits into train (85%) / val (5%) / test (10%)
 4. Writes Delta tables: `agency_ft_dataset_train_v3`, `agency_ft_dataset_val_v3`, `agency_ft_dataset_test_v3`
 
 **Run frequency:** Once (or when source data changes).
