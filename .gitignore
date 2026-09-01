@@ -228,8 +228,8 @@ __marimo__/
 .claude/
 
 # Local-only reference material and instructions (not for the public repo)
-references/
 CLAUDE.md
+.isaac/
 
 # Excluded from the published repo (kept local only)
 LLM_finetuning_workflow/cli/GOTCHAS.md   # internal bring-up notes / paper-cuts
