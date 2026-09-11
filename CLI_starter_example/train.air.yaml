@@ -1,0 +1,51 @@
+# =============================================================================
+# AI Runtime CLI job spec — wraps lora.yaml into a serverless-GPU training job.
+#
+# Run it directly (no Python driver):
+#
+#     cd CLI_example
+#     air run --file train.air.yaml --profile <your-profile>            # submit
+#     air run --file train.air.yaml --profile <your-profile> --watch    # submit + stream logs
+#     air run --file train.air.yaml --profile <your-profile> --dry-run  # validate only, no GPU
+#
+# Prereqs: air >= 1.1.0, and a workspace/profile with GPU_1xA10 quota.
+# =============================================================================
+
+experiment_name: axolotl-cli-example       # a SLUG (no slashes/dots); air resolves it to /Users/<you>/axolotl-cli-example
+mlflow_run_name: qwen05-lora-demo
+
+environment:
+  version: '5'                             # AI Runtime v5 (torch/transformers preloaded)
+  dependencies:
+    # axolotl 0.13.1 hard-pins trl==0.25.1 and torchao==0.13.0 — match them exactly
+    # or uv's resolver fails at env build. torchvision 0.23.0 matches the preloaded
+    # torch 2.8.0 (axolotl imports it at trainer-build time). mlflow left unpinned.
+    - "axolotl==0.13.1"
+    - "trl==0.25.1"
+    - "torchao==0.13.0"
+    - "torchvision==0.23.0"
+    - "mlflow"
+
+compute:
+  num_accelerators: 1                      # one A10 (24 GB) is plenty for a 0.5B LoRA
+  accelerator_type: GPU_1xA10              # A10s are far more available than H100s.
+                                           # Supported types: GPU_1xA10, GPU_1xH100, GPU_8xH100.
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: .                           # this folder (run `air run` from inside CLI_example)
+
+# $CODE_SOURCE_PATH is where the uploaded snapshot lands on the worker.
+#  - AXOLOTL_DO_NOT_TRACK=1 disables axolotl telemetry (its 0.13.1 wheel ships
+#    without the telemetry whitelist, so telemetry-on crashes at import).
+#  - The CODE=... line is a macOS guard: the Finder xattr on packaged files can make
+#    air materialise a sibling `._<dir>` on the Linux worker; if $CODE_SOURCE_PATH
+#    isn't a directory, fall back to the name with the leading `._` stripped.
+command: |
+  export AXOLOTL_DO_NOT_TRACK=1
+  CODE="$CODE_SOURCE_PATH"; [ -d "$CODE" ] || CODE="$(dirname "$CODE")/$(basename "$CODE" | sed 's/^\._//')"
+  axolotl train "$CODE/sft.yaml"
+
+max_retries: 0
+timeout_minutes: 60
