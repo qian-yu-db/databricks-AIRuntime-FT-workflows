@@ -14,6 +14,7 @@ Worked examples for **full-parameter fine-tuning of an open LLM on Databricks AI
 
 ```
 .
+├── CLI_starter_example/         # minimal starter: fine-tune a small model from the `air` CLI on YAML files
 ├── LLM_finetuning_workflow/     # full-parameter fine-tuning — two interchangeable stacks
 │   ├── notebooks/               #   notebook-driven pipeline (TRL SFTTrainer + DeepSpeed ZeRO-3)
 │   └── cli/                     #   CLI-driven, laptop end-to-end workflow via the `air` CLI (Axolotl full-FT + FSDP)
@@ -24,6 +25,8 @@ Each directory has its own `README.md` with design notes and step-by-step run in
 sections below orient you to which one to use.
 
 ## Fine-tuning workflows
+
+> **New to `air` + Axolotl? Start here:** [`CLI_starter_example/`](CLI_starter_example/README.md) is a minimal, no-data-prep example that fine-tunes Qwen2.5-0.5B on a single A10, directly from `air run` on two YAML files. Use it to learn the CLI, then move to the full workflows below.
 
 Fine-tune Qwen3-8B with **full-parameter SFT** (no LoRA) on information extraction task and evaluate with holdout dataset (see [Evaluation methodology](#evaluation-methodology)):
 
