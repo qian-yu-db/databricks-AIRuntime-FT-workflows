@@ -1,0 +1,67 @@
+# =============================================================================
+# Minimal Axolotl FULL fine-tune — Qwen2.5-0.5B on a tiny public alpaca sample.
+#
+# This is a plain Axolotl config. Everything the run needs (model + dataset) is
+# pulled from the Hugging Face Hub, so there is NO data-prep step. It trains in a
+# few minutes on a single GPU. Edit any value and re-run with:
+#
+#     air run --file train.air.yaml --profile <your-profile>
+#
+# (train.air.yaml wraps this file into an AI Runtime serverless-GPU job.)
+#
+# Full-parameter SFT — no `adapter:` block. We deliberately do NOT use LoRA here:
+# axolotl 0.13.1 pins torchao==0.13.0, but this peft's LoRA path requires
+# torchao>0.16.0, and overriding axolotl's pin breaks the env build. A 0.5B full
+# fine-tune fits easily on one A10, so full FT is the reliable simple path. See the
+# README "Make it your own" note before switching to LoRA.
+# =============================================================================
+
+base_model: Qwen/Qwen2.5-0.5B          # small, gated-free; swap for any HF model
+
+# --- Data: pulled straight from the HF Hub (alpaca-format instruct data) -------
+datasets:
+  - path: mhenrichsen/alpaca_2k_test   # ~2k rows — deliberately tiny for a demo
+    type: alpaca
+val_set_size: 0.1                      # hold out 10% so you get an eval-loss curve
+
+# --- Sequence / batching -------------------------------------------------------
+sequence_len: 1024
+sample_packing: false
+pad_to_sequence_len: true
+micro_batch_size: 2
+gradient_accumulation_steps: 4
+
+# --- Schedule ------------------------------------------------------------------
+# NOTE: write learning rates in DECIMAL form (0.00002), not 2e-5 — YAML parses the
+# bare scientific-notation form as a STRING, which then fails type validation.
+num_epochs: 1
+learning_rate: 0.00002                 # full-FT LR (lower than a LoRA LR)
+optimizer: adamw_torch
+lr_scheduler: cosine
+warmup_ratio: 0.03
+weight_decay: 0.0
+
+# --- Precision / memory --------------------------------------------------------
+bf16: true
+gradient_checkpointing: true
+flash_attention: false                 # SDPA — flash-attn won't build under uv isolation
+
+# --- Logging / eval / checkpoints ----------------------------------------------
+logging_steps: 5
+evals_per_epoch: 1
+save_strategy: epoch
+save_total_limit: 1
+# Worker-local (ephemeral — discarded when the job ends). To KEEP the model,
+# point this at a UC Volume you can write to, e.g.
+#   /Volumes/<catalog>/<schema>/<volume>/axolotl-qwen05-sft
+output_dir: /tmp/axolotl-qwen05-sft
+
+# --- MLflow --------------------------------------------------------------------
+# air creates the experiment (from train.air.yaml's experiment_name) and exports
+# MLFLOW_RUN_ID on the worker; Axolotl inherits that run. So do NOT set
+# mlflow_experiment_name here (it would fork a second experiment).
+use_mlflow: true
+mlflow_tracking_uri: databricks
+
+special_tokens:
+  pad_token: "<|endoftext|>"
