@@ -660,11 +660,16 @@ print(f"Ground truth: {len(gt_melted)} field values")
 # COMMAND ----------
 
 # DBTITLE 1,Compute field-level metrics
-# Merge predictions with ground truth
+# LEFT join on the GROUND TRUTH so every gold (File_Name, field) is scored. A doc the
+# endpoint failed/timed-out on is absent from OUTPUT_TABLE -> its prediction is NaN ->
+# fillna('NA') -> counts as a false negative (gt != 'NA', pred == 'NA'), NOT silently
+# dropped. An inner join here would shrink the denominator to only the docs that
+# succeeded and inflate the held-out F1 we report as the unbiased number. This mirrors
+# the CLI eval's build_scored(), which likewise makes errored docs count as FN.
 merged = pd.merge(
     gt_melted, outputs_melted,
     on=['File_Name', 'field'],
-    how='inner'
+    how='left'
 ).fillna('NA')
 
 # Fuzzy matching: consider a match if SequenceMatcher ratio > 0.6

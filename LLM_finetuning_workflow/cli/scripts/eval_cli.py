@@ -209,6 +209,15 @@ def main():
     ap.add_argument("--startup-timeout", type=int, default=1500)
     args = ap.parse_args()
 
+    # The held-out test set is scored ONCE, on the chosen winner — never over the whole
+    # grid (that would re-open the selection-on-test leak). Enforce it HERE, where the
+    # split->stage mapping lives, so a direct/manual `eval_cli.py --split test` (no --tag)
+    # is refused too — not only when routed through run_sweep.run_eval.
+    if args.split == "test" and not args.tag:
+        sys.exit("--split test requires --tag <winner>: the held-out test set is scored "
+                 "once on the chosen checkpoint, not over every checkpoint under "
+                 "--checkpoints-dir.")
+
     out_dir = args.checkpoints_dir.rstrip("/")
     eval_jsonl = args.eval_jsonl or os.path.join(args.data_dir, f"{args.split}.jsonl")
     records = [json.loads(line) for line in open(eval_jsonl)]

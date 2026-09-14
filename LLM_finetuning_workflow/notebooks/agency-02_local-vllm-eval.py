@@ -109,7 +109,13 @@ OCR_CHAR_CAP = 100000             # far-out failsafe (~25k tokens) — normal do
 # split (eval_split=val, the default) and ranks the winner on it, so the test set is
 # never used for model selection. The unbiased held-out TEST F1 is measured once on the
 # winning checkpoint in notebook 05. Set eval_split=test only for a deliberate one-off.
-EVAL_SPLIT = dbutils.widgets.get("eval_split")
+EVAL_SPLIT = dbutils.widgets.get("eval_split").strip()
+# Validate explicitly (the CLI guards this with argparse choices; do the same here).
+# Without this, a typo like "Val" / "test " would fall through to stage=test AND build a
+# nonexistent table name, silently mis-tagging the run before failing late at spark.table.
+assert EVAL_SPLIT in {"val", "test"}, (
+    f"eval_split must be 'val' or 'test', got {EVAL_SPLIT!r}"
+)
 STAGE = "eval" if EVAL_SPLIT == "val" else "test"    # stage=eval is what notebook 04 ranks
 EVAL_TABLE = f"{CATALOG}.{SCHEMA}.agency_ft_dataset_{EVAL_SPLIT}_v3"
 print(f"Eval split: {EVAL_SPLIT}  ->  table {EVAL_TABLE}  (MLflow stage={STAGE})")

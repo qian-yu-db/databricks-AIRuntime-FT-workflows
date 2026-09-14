@@ -16,6 +16,18 @@ import extract_eval
 import eval_cli
 
 
+def test_main_test_split_requires_tag(monkeypatch):
+    # --split test without --tag must be refused up front (at the layer that maps
+    # split->stage), so a manual eval_cli.py can't score the whole grid on the held-out
+    # test set — the selection-on-test leak. Exits before any file/vLLM work.
+    monkeypatch.setattr(sys, "argv", [
+        "eval_cli.py", "--data-dir", "/d", "--checkpoints-dir", "/c",
+        "--experiment", "/Users/me@databricks.com/exp", "--split", "test",
+    ])
+    with pytest.raises(SystemExit):
+        eval_cli.main()
+
+
 def test_shares_helpers_with_extract_eval():
     assert eval_cli.clean_response is extract_eval.clean_response
     assert eval_cli.score is extract_eval.score
