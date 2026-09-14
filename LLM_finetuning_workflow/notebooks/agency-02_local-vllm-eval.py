@@ -51,6 +51,10 @@ dbutils.widgets.text("learning_rate", "1e-5", "Learning Rate")
 dbutils.widgets.text("num_epochs", "3", "Num Epochs")
 dbutils.widgets.text("MAX_NEW_TOKENS", "3500", "Max New Tokens")
 dbutils.widgets.text("experiment_path", "/Users/q.yu@databricks.com/mlflow_experiments/agency-finetuning-ai-runtime", "MLflow Experiment Path")
+# Which split to score. `val` is the SELECTION eval the sweep ranks (logged stage=eval);
+# `test` is the held-out FINAL eval (logged stage=test), measured once on the winner in
+# notebook 05. Default val so the sweep never selects on the test set.
+dbutils.widgets.text("eval_split", "val", "Eval Split (val|test)")
 
 # COMMAND ----------
 
@@ -101,10 +105,23 @@ MAX_WORKERS = 4                   # concurrent /invocations requests
 OCR_CHAR_CAP = 100000             # far-out failsafe (~25k tokens) — normal docs are well under
 
 # --- Eval data / prompt -------------------------------------------------------
-TEST_TABLE = f"{CATALOG}.{SCHEMA}.agency_ft_dataset_test_v3"
+# SELECTION vs REPORTING. The sweep (notebook 04) runs this eval on the VALIDATION
+# split (eval_split=val, the default) and ranks the winner on it, so the test set is
+# never used for model selection. The unbiased held-out TEST F1 is measured once on the
+# winning checkpoint in notebook 05. Set eval_split=test only for a deliberate one-off.
+EVAL_SPLIT = dbutils.widgets.get("eval_split").strip()
+# Validate explicitly (the CLI guards this with argparse choices; do the same here).
+# Without this, a typo like "Val" / "test " would fall through to stage=test AND build a
+# nonexistent table name, silently mis-tagging the run before failing late at spark.table.
+assert EVAL_SPLIT in {"val", "test"}, (
+    f"eval_split must be 'val' or 'test', got {EVAL_SPLIT!r}"
+)
+STAGE = "eval" if EVAL_SPLIT == "val" else "test"    # stage=eval is what notebook 04 ranks
+EVAL_TABLE = f"{CATALOG}.{SCHEMA}.agency_ft_dataset_{EVAL_SPLIT}_v3"
+print(f"Eval split: {EVAL_SPLIT}  ->  table {EVAL_TABLE}  (MLflow stage={STAGE})")
 
 # Optional: persist raw model outputs for inspection. Set to None to skip writing.
-OUTPUT_TABLE = f"{CATALOG}.{SCHEMA}.agency_inference_output_qwen3_local_vllm_{RUN_TAG.replace('-', '_')}"
+OUTPUT_TABLE = f"{CATALOG}.{SCHEMA}.agency_inference_output_qwen3_local_vllm_{EVAL_SPLIT}_{RUN_TAG.replace('-', '_')}"
 
 # MLflow experiment for the eval metrics.
 EXPERIMENT_PATH = dbutils.widgets.get("experiment_path")
@@ -233,7 +250,7 @@ if not ready:
 
 # DBTITLE 1,Smoke test — single extraction request
 # One real extraction through the local server, exactly as batch inference calls it.
-sample_ocr = spark.table(TEST_TABLE).select("Raw_OCR_Content").limit(1).collect()[0][0]
+sample_ocr = spark.table(EVAL_TABLE).select("Raw_OCR_Content").limit(1).collect()[0][0]
 
 resp = requests.post(
     f"http://localhost:{LOCAL_PORT}/invocations",
@@ -253,7 +270,7 @@ print(resp.json()["choices"][0]["message"]["content"][:1500])
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 docs = (
-    spark.table(TEST_TABLE)
+    spark.table(EVAL_TABLE)
     .select("File_Name", "Raw_OCR_Content")
     .toPandas()
     .to_dict("records")
@@ -493,7 +510,7 @@ outputs_melted = pd.melt(outputs_pdf, id_vars=['File_Name'], var_name='field', v
 
 # Parse ground truths
 gt_pdf = (
-    spark.table(TEST_TABLE)
+    spark.table(EVAL_TABLE)
     .withColumn("gt", from_json(col("ground_truths"), extraction_schema))
     .select("File_Name", "gt.*")
     .toPandas()
@@ -579,13 +596,14 @@ import mlflow
 
 mlflow.set_experiment(EXPERIMENT_PATH)
 
-with mlflow.start_run(run_name="eval-qwen-agency-local-vllm") as run:
+with mlflow.start_run(run_name=f"{STAGE}-qwen-agency-local-vllm") as run:
     mlflow.log_metrics({f"all_{k}": v for k, v in overall.items()})
     mlflow.log_metrics({f"top8_{k}": v for k, v in top8.items()})
     mlflow.log_params({
         "weights_source": WEIGHTS_VOLUME_PATH,
         "inference": "local_vllm",   # no serving endpoint
-        "test_table": TEST_TABLE,
+        "eval_split": EVAL_SPLIT,
+        "eval_table": EVAL_TABLE,
         "matching_threshold": 0.6,
         "max_model_len": MAX_MODEL_LEN,
         "max_new_tokens": MAX_NEW_TOKENS,
@@ -594,5 +612,8 @@ with mlflow.start_run(run_name="eval-qwen-agency-local-vllm") as run:
         "learning_rate": _lr_str,
         "num_epochs": _ep_str,
     })
-    mlflow.set_tags({"approach": "local-vllm-no-endpoint", "stage": "eval"})
-    print(f"Metrics logged to MLflow run: {run.info.run_id}")
+    # stage=eval marks the VALIDATION selection runs that notebook 04 ranks; stage=test
+    # marks the held-out final. Keeping them on different stages stops the sweep ranking
+    # from ever picking up a test run.
+    mlflow.set_tags({"approach": "local-vllm-no-endpoint", "stage": STAGE})
+    print(f"Metrics logged to MLflow run: {run.info.run_id}  (split={EVAL_SPLIT}, stage={STAGE})")

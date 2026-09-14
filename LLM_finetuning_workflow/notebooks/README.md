@@ -18,19 +18,25 @@ flowchart TB
     subgraph JOB["Databricks Job — one run per sweep cell"]
         direction LR
         N01["Notebook 01 — Train<br/>(8×H100 GPU)"]
-        N02["Notebook 02 — Eval, vLLM<br/>(1×H100 GPU)"]
+        N02["Notebook 02 — Val Eval, vLLM<br/>(1×H100 GPU)"]
         N01 -->|"checkpoint"| N02
     end
 
-    MLF[("MLflow<br/>runs + eval F1")]
+    MLF[("MLflow<br/>val runs stage=eval<br/>test run stage=test")]
 
     N00 -->|"train / val / test splits"| N01
     N03 -.->|"composes 01 + 02, creates job"| JOB
     N04 ==>|"run_now() per grid cell — iterate"| JOB
-    N02 -->|"log eval F1"| MLF
-    MLF -->|"rank runs, pick best tag"| N04
+    N02 -->|"log VALIDATION F1 (stage=eval)"| MLF
+    MLF -->|"rank val runs, pick best tag"| N04
     N04 -->|"winning checkpoint_tag"| N05
+    N05 -->|"log HELD-OUT TEST F1 (stage=test)"| MLF
 ```
+
+> **Selection vs. reporting.** The sweep selects the winner on the **validation** set
+> (notebook 02, `stage=eval`, ranked by notebook 04). The **held-out test** set is
+> scored **once** on that winner in notebook 05 (`stage=test`) — the unbiased number to
+> report. Test is never used for selection, so the reported F1 isn't selection-biased.
 
 ---
 
@@ -59,6 +65,22 @@ All notebooks expose `catalog`, `schema`, `volume`, and `volume_model` as **widg
 2. Formats each example as a multi-turn chat (system + user + assistant) using Qwen3's chat template
 3. Splits into train (85%) / val (5%) / test (10%)
 4. Writes Delta tables: `agency_ft_dataset_train_v3`, `agency_ft_dataset_val_v3`, `agency_ft_dataset_test_v3`
+
+**Split roles** (this is the whole point of having three):
+
+| Split | Table | Used by | Metric | Role |
+| --- | --- | --- | --- | --- |
+| Train | `..._train_v3` | notebook 01 | training loss | fit the weights |
+| Val | `..._val_v3` | notebook 01 (`eval_strategy=epoch`) + notebook 02 (`eval_split=val`) | eval loss + **validation F1** (`stage=eval`) | in-run checkpoint keeping + cross-sweep **selection** |
+| Test | `..._test_v3` | notebook 05 | **test F1** (`stage=test`) | **held-out reporting**, scored once on the winner |
+
+**Select on val, report on test:** the sweep is ranked on validation (so the test set
+stays untouched for selection), and the winner's unbiased test F1 is measured once in
+notebook 05.
+
+> The split is a random row split — it does **not** dedup near-duplicate documents or
+> shared customers/templates across splits. If your corpus has that structure, dedup
+> before splitting, or test F1 will be inflated regardless of the val/test discipline.
 
 **Run frequency:** Once (or when source data changes).
 
@@ -116,7 +138,9 @@ Genie code has build-in [data science & ML agent](https://docs.databricks.com/aw
 
 **Compute:** Serverless GPU — 1×H100
 
-**Purpose:** Evaluates a fine-tuned checkpoint without deploying a serving endpoint. Launches a **local vLLM server** inside the notebook, runs batch inference over the test set, and scores field-level precision/recall/F1.
+**Purpose:** Evaluates a fine-tuned checkpoint without deploying a serving endpoint. Launches a **local vLLM server** inside the notebook, runs batch inference over the eval split, and scores field-level precision/recall/F1.
+
+**Which split (the `eval_split` widget):** defaults to **`val`** — the sweep's selection eval, logged `stage=eval` and ranked by notebook 04, so the test set is never used for selection. Reads `agency_ft_dataset_{eval_split}_v3`. The held-out **test** eval is run once on the winner in notebook 05 (`stage=test`); set `eval_split=test` here only for a deliberate one-off.
 
 **How local vLLM works:**
 
@@ -132,7 +156,8 @@ This notebook is developed based on this [Databricks official document example](
 
 * `all_f1`, `all_precision`, `all_recall` — across all 78+ extraction fields
 * `top8_f1`, `top8_precision`, `top8_recall` — 9 high-priority business fields (PolicyNumber, OwnerPolicyNumber/Amount/Date, LoanPolicyNumber/Amount/Date, OwnerFile, LoanFile)
-* Tagged with `stage: "eval"` for filtering in notebook 04
+* `eval_split` param records which split was scored
+* Tagged with `stage: "eval"` (when `eval_split=val`) so notebook 04 ranks it, or `stage: "test"` (when `eval_split=test`) so it is excluded from the sweep ranking
 
 **Scoring approach:** Fuzzy matching (SequenceMatcher ratio > 0.6) handles minor OCR/formatting differences between ground truth and predictions.
 
@@ -150,7 +175,9 @@ This notebook is developed based on this [Databricks official document example](
 | `eval` | notebook 02 | GPU 1×H100 | Evaluate the checkpoint |
 
 **Job parameters** (overridable at run time):
-`catalog`, `schema`, `volume`, `volume_model`, `learning_rate`, `num_epochs`, `max_seq_length`, `per_device_batch_size`, `gradient_accumulation_steps`, `num_gpus`, `gpu_type`, `experiment_path`, `DTYPE`, `MAX_MODEL_LEN`, `MAX_NEW_TOKENS`
+`catalog`, `schema`, `volume`, `volume_model`, `learning_rate`, `num_epochs`, `max_seq_length`, `per_device_batch_size`, `gradient_accumulation_steps`, `num_gpus`, `gpu_type`, `experiment_path`, `DTYPE`, `MAX_MODEL_LEN`, `MAX_NEW_TOKENS`, `eval_split`
+
+`eval_split` defaults to `val` so the sweep's eval task scores the validation set (`stage=eval`) — selection never touches the held-out test set.
 
 **Notes**
 
@@ -174,14 +201,14 @@ This notebook is developed based on this [Databricks official document example](
 **Workflow:**
 
 1. Defines a sweep grid (e.g., `learning_rate × num_epochs` combinations)
-2. Submits each combination as a separate job run via `w.jobs.run_now()`
+2. Submits each combination as a separate job run via `w.jobs.run_now()` with `eval_split=val`
 3. Polls until all runs complete
-4. Queries MLflow for eval runs tagged `stage=eval`, ranks by `all_f1`
-5. Prints the winning checkpoint tag (e.g., `lr2e-5_ep4`)
+4. Queries MLflow for **validation** eval runs tagged `stage=eval`, ranks by `all_f1` (test runs, `stage=test`, are excluded)
+5. Prints the winning checkpoint tag (e.g., `lr2e-5_ep4`) — these are **validation** metrics (selection-biased)
 
-**Output:** The best `checkpoint_tag` — manually entered into notebook 05's widget for registration and deployment.
+**Output:** The best `checkpoint_tag` — manually entered into notebook 05's widget for registration, deployment, and the unbiased held-out **test** measurement.
 
-**Note:** The best model selection will compare all the eval runs within a MLflow experiment, i.e. one hyper-parameters sweep
+**Note:** The best model selection compares the **validation** eval runs within a MLflow experiment (one hyper-parameter sweep). The winner's validation F1 is an optimistic (max-over-grid) estimate; the honest number comes from notebook 05's held-out test eval.
 
 ---
 
@@ -201,7 +228,8 @@ This notebook is developed based on this [Databricks official document example](
 6. Register to UC with `env_pack="databricks_model_serving"` — packages the notebook's installed environment (vllm, transformers, etc.) into the model version
 7. Wait for version to reach READY (env_pack processing takes 20-30 min for 16 GB models)
 8. Create/update the serving endpoint
-9. Endpoint santity check using `ai_query`
+9. Endpoint sanity check using `ai_query`
+10. **Held-out test evaluation** — `ai_query()` over the **test** set, field-level P/R/F1 + top-8, logged to MLflow tagged `stage=test` (same experiment as the sweep, so it sits beside the winner's `stage=eval` validation run). This is the **unbiased** number to report: the checkpoint was selected on validation in notebook 04, and this is the only time the test set is scored.
 
 **Why registration runs on GPU:**
 
@@ -238,9 +266,9 @@ The endpoint uses `task: "llm/v1/chat"` with a custom entrypoint, so Databricks 
 ### Hyperparameter sweep
 
 1. Configure the sweep grid in **notebook 04** cell 4
-2. Run cells 2–8 to submit all runs and collect results
+2. Run cells 2–8 to submit all runs and collect results — the ranking is on the **validation** set (`stage=eval`), so the winner is chosen without touching the test set
 3. Copy the winning checkpoint tag into **notebook 05**'s `checkpoint_tag` widget
-4. Run notebook 05 cells 2–17 to register and deploy
+4. Run notebook 05 to register, deploy, and measure the **held-out test F1** on the winner (`stage=test`) — the unbiased number to report
 
 ### Iterating on a deployed model
 

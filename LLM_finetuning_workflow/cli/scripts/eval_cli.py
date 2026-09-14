@@ -15,8 +15,11 @@ pip-pulled opencv vendors OpenSSL 1.1.1k and aborts vLLM's model-inspection
 subprocess on the FIPS self-test). Requires `air >= 1.1.0` to accept the named
 image version. See the README ("CLI vLLM eval on a FIPS workspace" section).
 
-It has NO Spark / dbutils dependency (reads test.jsonl with plain open(), scores
-with difflib), and imports the scoring/response helpers from lib/extract_eval.py.
+It has NO Spark / dbutils dependency (reads <data-dir>/<split>.jsonl with plain open(),
+scores with difflib), and imports the scoring/response helpers from lib/extract_eval.py.
+`--split val` (default) is the SELECTION eval (logs stage=eval, ranked by
+run_sweep.py --pick-best); `--split test` is the held-out FINAL eval (logs stage=test),
+run once on the winner so the reported F1 isn't selection-biased.
 
     python eval_cli.py --data-dir /Volumes/.../training_data/qwen_sweep \\
         --checkpoints-dir /Volumes/.../checkpoints/qwen_sweep \\
@@ -185,14 +188,20 @@ def eval_one(tag, ckpt, records, args):
 def main():
     ap = argparse.ArgumentParser(description="CLI vLLM eval of fine-tuned Qwen checkpoints.")
     ap.add_argument("--data-dir", required=True,
-                    help="sweep data dir; test set at <data-dir>/test.jsonl")
+                    help="sweep data dir; the eval split is read from <data-dir>/<split>.jsonl")
     ap.add_argument("--checkpoints-dir", required=True,
                     help="checkpoint root; each checkpoint at <checkpoints-dir>/<tag>/")
     ap.add_argument("--experiment", required=True,
                     help="MLflow experiment ABSOLUTE path, e.g. /Users/you@databricks.com/qwen-ft-sweep")
     ap.add_argument("--tag", default=None,
                     help="single checkpoint tag under --checkpoints-dir; omit to evaluate ALL")
-    ap.add_argument("--test-jsonl", default=None, help="override; default <data-dir>/test.jsonl")
+    # Which split to score. `val` is the SELECTION eval (logged stage=eval, ranked by
+    # --pick-best); `test` is the held-out FINAL eval (logged stage=test), run once on
+    # the winner AFTER selection so the reported number isn't selection-biased. Keeping
+    # them on different stages stops --pick-best from ever ranking a test run.
+    ap.add_argument("--split", choices=["val", "test"], default="val",
+                    help="data split to score: val (selection, stage=eval) or test (held-out final, stage=test)")
+    ap.add_argument("--eval-jsonl", default=None, help="override the split file; default <data-dir>/<split>.jsonl")
     ap.add_argument("--max-new-tokens", type=int, default=3500)
     ap.add_argument("--max-model-len", type=int, default=32768)
     ap.add_argument("--gpu-memory-util", type=float, default=0.90)
@@ -200,10 +209,19 @@ def main():
     ap.add_argument("--startup-timeout", type=int, default=1500)
     args = ap.parse_args()
 
+    # The held-out test set is scored ONCE, on the chosen winner — never over the whole
+    # grid (that would re-open the selection-on-test leak). Enforce it HERE, where the
+    # split->stage mapping lives, so a direct/manual `eval_cli.py --split test` (no --tag)
+    # is refused too — not only when routed through run_sweep.run_eval.
+    if args.split == "test" and not args.tag:
+        sys.exit("--split test requires --tag <winner>: the held-out test set is scored "
+                 "once on the chosen checkpoint, not over every checkpoint under "
+                 "--checkpoints-dir.")
+
     out_dir = args.checkpoints_dir.rstrip("/")
-    test_jsonl = args.test_jsonl or os.path.join(args.data_dir, "test.jsonl")
-    records = [json.loads(line) for line in open(test_jsonl)]
-    print(f"Loaded {len(records)} test records from {test_jsonl}")
+    eval_jsonl = args.eval_jsonl or os.path.join(args.data_dir, f"{args.split}.jsonl")
+    records = [json.loads(line) for line in open(eval_jsonl)]
+    print(f"Loaded {len(records)} {args.split} records from {eval_jsonl}")
 
     if args.tag:
         tags = [args.tag]
@@ -233,13 +251,19 @@ def main():
 
 
 def evaluate_tags(tags, out_dir, records, args):
-    """Eval each tag, logging one stage=eval MLflow run per success. A checkpoint that
-    fails (vLLM won't serve, weights missing, all requests error) is logged to stdout
-    and SKIPPED — one bad checkpoint must not abort a bare-`--eval` batch of many.
-    Returns a per-tag summary (failed entries carry {"failed": True})."""
+    """Eval each tag, logging one MLflow run per success. A checkpoint that fails (vLLM
+    won't serve, weights missing, all requests error) is logged to stdout and SKIPPED —
+    one bad checkpoint must not abort a bare-`--eval` batch of many. Returns a per-tag
+    summary (failed entries carry {"failed": True}).
+
+    The MLflow stage is derived from the split: `val` -> stage=eval (the SELECTION run
+    that --pick-best ranks), `test` -> stage=test (the held-out FINAL run). This keeps
+    selection and reporting on separate stages so ranking never sees a test run."""
     import mlflow
     mlflow.set_experiment(args.experiment)
 
+    split = getattr(args, "split", "val")
+    stage = "eval" if split == "val" else "test"
     summary = []
     for tag in tags:
         ckpt = os.path.join(out_dir, tag)
@@ -253,10 +277,11 @@ def evaluate_tags(tags, out_dir, records, args):
             summary.append({"tag": tag, "all_f1": float("nan"), "top8_f1": float("nan"),
                             "docs": 0, "errors": 0, "failed": True})
             continue
-        with mlflow.start_run(run_name=f"eval_{tag}"):
+        with mlflow.start_run(run_name=f"{stage}_{tag}"):
             mlflow.log_param("model_path", ckpt)
             mlflow.log_param("checkpoint_tag", tag)
-            mlflow.set_tags({"sweep_id": "qwen-ft-sweep", "stage": "eval", "eval_via": "cli-air"})
+            mlflow.log_param("eval_split", split)
+            mlflow.set_tags({"sweep_id": "qwen-ft-sweep", "stage": stage, "eval_via": "cli-air"})
             mlflow.log_metrics({f"all_{k}": v for k, v in overall.items()})
             mlflow.log_metrics({f"top8_{k}": v for k, v in top8.items()})
         summary.append({"tag": tag, "all_f1": overall["f1"], "top8_f1": top8["f1"],

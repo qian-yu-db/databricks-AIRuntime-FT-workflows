@@ -47,6 +47,10 @@ DEFAULTS = {
     "MAX_MODEL_LEN": "32768",
     "MAX_NEW_TOKENS": "3500",
     "experiment_path": "/Users/q.yu@databricks.com/mlflow_experiments/agency-finetuning-ai-runtime-sweep",
+    # The sweep's eval task scores the VALIDATION split so selection never touches the
+    # held-out test set (that is measured once on the winner in notebook 05). Overridable
+    # per run, but leave it `val` for a sweep.
+    "eval_split": "val",
 }
 
 # COMMAND ----------
@@ -114,6 +118,7 @@ tasks = [
                 "MAX_MODEL_LEN": "{{job.parameters.MAX_MODEL_LEN}}",
                 "MAX_NEW_TOKENS": "{{job.parameters.MAX_NEW_TOKENS}}",
                 "experiment_path": "{{job.parameters.experiment_path}}",
+                "eval_split": "{{job.parameters.eval_split}}",
             },
         },
     },

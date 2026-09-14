@@ -17,17 +17,25 @@ Run from your laptop (not on Databricks), from the repo root:
     python scripts/run_sweep.py --profile e2_demo_fieldeng --status            # per-cell checkpoint status (local, no GPU)
     python scripts/run_sweep.py --profile e2_demo_fieldeng --resume            # (re)submit only cells missing a checkpoint
     python scripts/run_sweep.py --profile e2_demo_fieldeng --resume --serialize-start  # resume, throttled
-    python scripts/run_sweep.py --profile e2_demo_fieldeng --eval              # eval ALL checkpoints (one 1xH100 job)
-    python scripts/run_sweep.py --profile e2_demo_fieldeng --eval --only lr1e-5_ep4  # eval one checkpoint
-    python scripts/run_sweep.py --profile e2_demo_fieldeng --pick-best         # rank eval runs by F1 (local, no GPU)
+    python scripts/run_sweep.py --profile e2_demo_fieldeng --eval              # SELECTION eval: score ALL checkpoints on VAL (one 1xH100 job)
+    python scripts/run_sweep.py --profile e2_demo_fieldeng --eval --only lr1e-5_ep4  # eval one checkpoint on VAL
+    python scripts/run_sweep.py --profile e2_demo_fieldeng --pick-best         # rank VAL eval runs by F1 (local, no GPU)
+    python scripts/run_sweep.py --profile e2_demo_fieldeng --eval --split test --only lr1e-5_ep4  # HELD-OUT test eval on the winner
     python scripts/run_sweep.py --profile e2_demo_fieldeng --register --only lr1e-5_ep4  # register that checkpoint to UC
 
-Completion is judged by the checkpoint the cell writes (<checkpoints_dir>/<tag>/config.json,
-grid.yaml), NOT by air's run status — air's JSON isn't tag-addressable. So --status and
---resume reflect exactly the checkpoints the eval step will find.
+Completion is judged by the WEIGHTS the cell writes (<checkpoints_dir>/<tag>/, e.g.
+model.safetensors.index.json — see WEIGHTS_DONE_MARKERS; NOT config.json, which is
+written first and would false-positive a still-in-flight save), NOT by air's run status
+(air's JSON isn't tag-addressable). So --status and --resume reflect exactly the
+completed checkpoints the eval step can actually load.
+
+Selection vs. reporting are two different splits: --eval defaults to --split val, so the
+sweep is RANKED on the validation set (stage=eval) and the winner is chosen there. The
+held-out test set is scored ONCE on that winner (--eval --split test --only <tag>,
+stage=test) — an unbiased final number, never used for selection.
 
 The end-to-end loop is all from this one driver:
-    (submit train) -> --status -> --eval -> --pick-best -> --register --only <tag>
+    (submit train) -> --status -> --eval (val) -> --pick-best -> --eval --split test --only <tag> -> --register --only <tag>
 
 --register submits a GPU_1xH100 job (configs/register.air.yaml + register_model.py)
 that registers ONE checkpoint (--only <tag>, required and explicit) to the UC Model
@@ -94,9 +102,24 @@ def grid_cells(grid: dict):
 # --- Volume-checkpoint state (the source of truth for "is this cell done") ----
 # air's run status is not tag-addressable (its run_name is the experiment slug and
 # its run_id != the MLflow run_id), so we key completion off the CHECKPOINT the cell
-# writes: <checkpoints_dir>/<tag>/config.json. This is the same artifact --eval
-# discovers, is listable from the laptop via the databricks CLI, and is
-# unambiguous per cell. A cell is DONE iff that file exists.
+# writes under <checkpoints_dir>/<tag>/. This is the same artifact --eval discovers,
+# is listable from the laptop via the databricks CLI, and is unambiguous per cell.
+#
+# Completion marker: a WEIGHTS file, NOT config.json. `save_pretrained` writes
+# config.json FIRST (before the weight shards), so a dir with only config.json is a
+# half-written checkpoint — an in-flight save whose weights aren't there yet. vLLM
+# would then fail to load it ("Cannot find any model weights"). The safe "done"
+# signal is the file written LAST: the sharded-safetensors index
+# (model.safetensors.index.json), or the single-file weights (model.safetensors) for
+# an unsharded model. We accept the pytorch_model.* equivalents too. A cell is DONE
+# iff its dir contains one of these.
+WEIGHTS_DONE_MARKERS = frozenset({
+    "model.safetensors.index.json",   # sharded safetensors — written after all shards
+    "model.safetensors",              # single-shard safetensors
+    "pytorch_model.bin.index.json",   # sharded .bin fallback
+    "pytorch_model.bin",              # single-shard .bin fallback
+})
+
 
 def _volume_out_dir(grid: dict) -> str:
     # Checkpoints live under checkpoints_dir (separate from data_dir), one per cell
@@ -105,8 +128,10 @@ def _volume_out_dir(grid: dict) -> str:
 
 
 def completed_tags(grid: dict, profile: str) -> set:
-    """Tags whose checkpoint dir on the Volume contains config.json (i.e. training
-    finished and saved). Uses `databricks fs ls`; returns empty set on any error."""
+    """Tags whose checkpoint dir on the Volume holds a completed WEIGHTS save (i.e.
+    training finished and the weights are fully written — see WEIGHTS_DONE_MARKERS,
+    NOT config.json, which is written first and would false-positive a mid-save).
+    Uses `databricks fs ls`; returns empty set on any error."""
     out_dir = _volume_out_dir(grid)
     done = set()
     try:
@@ -125,7 +150,7 @@ def completed_tags(grid: dict, profile: str) -> set:
                 capture_output=True, text=True,
             )
             if sub.returncode == 0 and any(
-                ln.strip() == "config.json" for ln in sub.stdout.splitlines()
+                ln.strip() in WEIGHTS_DONE_MARKERS for ln in sub.stdout.splitlines()
             ):
                 done.add(tag)
     except FileNotFoundError:
@@ -235,15 +260,17 @@ def render_air_config(grid: dict, tag: str, axolotl_cfg_name: str) -> Path:
     return out
 
 
-def render_eval_air_config(grid: dict, tag) -> Path:
+def render_eval_air_config(grid: dict, tag, split: str = "val") -> Path:
     """Copy eval.air.yaml and fill placeholders for a CLI vLLM eval.
 
     `tag` is a single checkpoint tag, or None to evaluate EVERY checkpoint under
-    out/ in one job. Eval always runs on a single GPU (GPU_1xH100), independent of
-    the 8xH100 training grid, and keeps environment.version: databricks_ai_v5 from
-    the template (the FIPS lever — do not override). eval_cli.py logs via the MLflow
-    API, so it needs the ABSOLUTE experiment path (grid.yaml mlflow_experiment_path),
-    not air's slug.
+    checkpoints_dir in one job. `split` picks which held-out file eval_cli scores:
+    `val` (the SELECTION eval that --pick-best ranks, logged stage=eval) or `test`
+    (the held-out FINAL eval, logged stage=test, run once on the winner). Eval always
+    runs on a single GPU (GPU_1xH100), independent of the 8xH100 training grid, and
+    keeps environment.version: databricks_ai_v5 from the template (the FIPS lever — do
+    not override). eval_cli.py logs via the MLflow API, so it needs the ABSOLUTE
+    experiment path (grid.yaml mlflow_experiment_path), not air's slug.
     """
     with open(CONFIGS / "eval.air.yaml") as f:
         air = yaml.safe_load(f)
@@ -255,7 +282,7 @@ def render_eval_air_config(grid: dict, tag) -> Path:
     exp_path = grid["mlflow_experiment_path"]
 
     air["experiment_name"] = grid["mlflow_experiment"]
-    air["mlflow_run_name"] = f"cli_eval_{name}"
+    air["mlflow_run_name"] = f"cli_eval_{split}_{name}"
     air["compute"]["num_accelerators"] = 1
     air["compute"]["accelerator_type"] = "GPU_1xH100"
     air["code_source"]["snapshot"]["root_path"] = str(project_root)
@@ -264,14 +291,15 @@ def render_eval_air_config(grid: dict, tag) -> Path:
     # resolver (the AppleDouble `._` workaround). eval_cli.py reads lib/ from $CODE.
     eval_cmd = (
         f"python -u $CODE/scripts/eval_cli.py "
-        f"--data-dir {data_dir} --checkpoints-dir {checkpoints_dir} --experiment {exp_path}"
+        f"--data-dir {data_dir} --checkpoints-dir {checkpoints_dir} "
+        f"--experiment {exp_path} --split {split}"
     )
     if tag:
         eval_cmd += f" --tag {tag}"
     air["command"] = CODE_RESOLVER + eval_cmd + "\n"
 
     GENERATED.mkdir(exist_ok=True)
-    out = GENERATED / f"eval_{name}.yaml"
+    out = GENERATED / f"eval_{split}_{name}.yaml"
     with open(out, "w") as f:
         yaml.safe_dump(air, f, sort_keys=False)
     return out
@@ -283,14 +311,28 @@ def run_eval(grid: dict, args):
     Mirrors the train submission path (generate -> optional throttle -> `air run`).
     Unlike train, eval passes NO idempotency key by default, so each --eval scores
     whatever checkpoints currently exist under checkpoints_dir (pass --idem-suffix to
-    force a dedup key if you need one). Logs stage=eval runs that --pick-best ranks."""
+    force a dedup key if you need one).
+
+    --split val (default) is the SELECTION eval — logs stage=eval runs that --pick-best
+    ranks. --split test is the held-out FINAL eval — logs stage=test, run once on the
+    winner (`--split test --only <tag>`) so the reported F1 isn't selection-biased."""
     if not grid.get("mlflow_experiment_path"):
         print("--eval needs `mlflow_experiment_path` (absolute /Users/.../<exp>) in "
               "grid.yaml — eval_cli.py logs via the MLflow API, which can't use the "
               "bare `mlflow_experiment` slug.", file=sys.stderr)
         return 1
 
+    split = getattr(args, "split", "val")
     tag = args.only or None
+
+    # The held-out test eval is meant to score the ONE winning checkpoint, so require
+    # an explicit --only — a bare `--eval --split test` over the whole grid would score
+    # every checkpoint on test and re-open the selection-on-test leak this split fixes.
+    if split == "test" and not tag:
+        print("--eval --split test needs --only <tag> (the winner from --pick-best): the "
+              "held-out test set is scored ONCE on the chosen checkpoint, not over the "
+              "whole grid.", file=sys.stderr)
+        return 1
 
     # Guard a single-cell eval: fail locally if the checkpoint isn't on the Volume,
     # instead of spinning up a GPU worker that dies in shutil.copytree. Bare --eval
@@ -300,11 +342,13 @@ def run_eval(grid: dict, args):
             return 1
 
     name = tag or "all"
+    stage = "eval" if split == "val" else "test"
     scope = f"checkpoint '{tag}'" if tag else "ALL checkpoints under checkpoints_dir"
-    print(f"Mode: EVAL  |  {scope}  |  GPU_1xH100 (databricks_ai_v5)")
+    kind = "SELECTION (val)" if split == "val" else "HELD-OUT FINAL (test)"
+    print(f"Mode: EVAL {kind}  |  {scope}  |  GPU_1xH100 (databricks_ai_v5)  |  logs stage={stage}")
     print(f"Experiment: {grid['mlflow_experiment_path']}")
 
-    eval_cfg = render_eval_air_config(grid, tag)
+    eval_cfg = render_eval_air_config(grid, tag, split)
     print(f"generated: {eval_cfg.name}")
     if args.print_only:
         print(f"\nConfig written to {GENERATED}/ . Submit manually with `air run --file {eval_cfg}`.")
@@ -313,7 +357,7 @@ def run_eval(grid: dict, args):
     if args.serialize_start and not args.dry_run:
         wait_for_slot(args.profile, args.max_active)
     # Default: no idempotency key (re-eval scores current checkpoints). Opt in via --idem-suffix.
-    idem_key = f"qwen-sweep-eval-{name}-{args.idem_suffix}" if args.idem_suffix else None
+    idem_key = f"qwen-sweep-eval-{split}-{name}-{args.idem_suffix}" if args.idem_suffix else None
     return submit(eval_cfg, grid, args.profile, args.dry_run, name, args.watch, idem_key)
 
 
@@ -386,11 +430,13 @@ def run_register(grid: dict, args):
 
 
 def pick_best(grid: dict, profile: str):
-    """Rank eval runs by F1 via the MLflow API — pure query, runs locally (no GPU).
+    """Rank the VALIDATION eval runs by F1 via the MLflow API — pure query, no GPU.
 
-    Queries the sweep experiment for runs tagged stage=eval and prints the ranking.
-    Requires the tracking URI to point at the Databricks workspace; we set it from
-    the CLI profile so this works from your laptop.
+    Queries the sweep experiment for runs tagged stage=eval (the `--split val`
+    selection evals — NOT the held-out stage=test runs) and prints the ranking, so
+    the winner is chosen on val and the test set stays untouched for a single final
+    measurement. Requires the tracking URI to point at the Databricks workspace; we
+    set it from the CLI profile so this works from your laptop.
     """
     import os
     os.environ["DATABRICKS_CONFIG_PROFILE"] = profile
@@ -437,12 +483,21 @@ def pick_best(grid: dict, profile: str):
     table = runs[cols].rename(columns=lambda c: c.split(".")[-1])
     header = (f"latest eval per tag — {n_tags} of {n_all} runs" if deduped
               else f"{n_all} eval runs (no checkpoint_tag/start_time to dedup)")
-    print(f"\n=== Sweep eval ranking ({header}) ===")
+    print(f"\n=== Sweep VALIDATION ranking, stage=eval ({header}) ===")
     print(table.to_string(index=False))
     best = table.iloc[0]
-    print(f"\nWinner: {best.get('checkpoint_tag', '?')}  "
+    winner = best.get("checkpoint_tag", "?")
+    print(f"\nWinner (by val F1): {winner}  "
           f"all_f1={best.get('all_f1', float('nan')):.4f}  "
           f"top8_f1={best.get('top8_f1', float('nan')):.4f}")
+    # The winner was selected on val, so its val F1 is optimistically biased (max over
+    # the grid). Get an unbiased number by scoring the held-out test set ONCE on it:
+    prof = f" --profile {profile}" if profile else ""
+    print(f"\nNext: measure the held-out TEST F1 for the winner (run once, reports the "
+          f"unbiased number, logs stage=test):\n"
+          f"  python scripts/run_sweep.py{prof} --eval --split test --only {winner}\n"
+          f"then register it:\n"
+          f"  python scripts/run_sweep.py{prof} --register --only {winner}")
     return 0
 
 
@@ -467,7 +522,8 @@ def wait_for_slot(profile: str, max_active: int, poll_s: int = 30, timeout_s: in
 
 def print_status(grid: dict, profile: str):
     """Per-cell status table keyed off the Volume checkpoint (done/missing), plus the
-    current active-run count. Read-only; source of truth is <checkpoints_dir>/<tag>/config.json."""
+    current active-run count. Read-only; source of truth is the completed-weights
+    marker under <checkpoints_dir>/<tag>/ (see WEIGHTS_DONE_MARKERS)."""
     done = completed_tags(grid, profile)
     all_cells = list(grid_cells(grid))
     n_active = active_run_count(profile)
@@ -525,7 +581,8 @@ def main():
     ap.add_argument("--watch", action="store_true", help="stream logs inline (air run --watch); best with --only")
     ap.add_argument("--idem-suffix", default="", help="append to the idempotency key to force a fresh run (e.g. v2) after a failed cell")
     ap.add_argument("--print-only", action="store_true", help="generate configs, do not call air")
-    ap.add_argument("--eval", action="store_true", help="submit a CLI vLLM eval (GPU_1xH100, databricks_ai_v5) of ALL checkpoints under checkpoints_dir, or one with --only <tag>; logs stage=eval runs for --pick-best")
+    ap.add_argument("--eval", action="store_true", help="submit a CLI vLLM eval (GPU_1xH100, databricks_ai_v5) of ALL checkpoints under checkpoints_dir, or one with --only <tag>; --split val (default) logs stage=eval runs for --pick-best")
+    ap.add_argument("--split", choices=["val", "test"], default="val", help="eval split: val (selection, stage=eval, default) or test (held-out final on the winner, stage=test; requires --only)")
     ap.add_argument("--pick-best", action="store_true", help="rank eval runs by F1 via MLflow (local, no GPU) and exit")
     ap.add_argument("--register", action="store_true", help="register the --only <tag> checkpoint to UC (grid.yaml registered_model) as a vLLM ChatModel via env_pack (GPU_1xH100); register-only, no serving endpoint")
     ap.add_argument("--status", action="store_true", help="print per-cell checkpoint status (local, no GPU) and exit")

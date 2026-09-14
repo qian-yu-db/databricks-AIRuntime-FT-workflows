@@ -54,10 +54,10 @@ def test_grid_cells_cartesian_product(grid):
 # --- eval spec renderer (the new code path) ----------------------------------
 def test_render_eval_air_config_all_checkpoints(tmp_path, monkeypatch, grid):
     monkeypatch.setattr(run_sweep, "GENERATED", tmp_path)
-    out = run_sweep.render_eval_air_config(grid, None)
+    out = run_sweep.render_eval_air_config(grid, None)     # split defaults to val
     cfg = yaml.safe_load(out.read_text())
 
-    assert out.name == "eval_all.yaml"
+    assert out.name == "eval_val_all.yaml"
     assert cfg["environment"]["version"] == "databricks_ai_v5"   # the FIPS lever
     assert cfg["compute"]["num_accelerators"] == 1
     assert cfg["compute"]["accelerator_type"] == "GPU_1xH100"
@@ -69,6 +69,7 @@ def test_render_eval_air_config_all_checkpoints(tmp_path, monkeypatch, grid):
     assert f"--data-dir {grid['data_dir']}" in cmd
     assert f"--checkpoints-dir {grid['checkpoints_dir']}" in cmd
     assert f"--experiment {grid['mlflow_experiment_path']}" in cmd
+    assert "--split val" in cmd                                  # selection eval defaults to val
     assert "--tag" not in cmd                                    # all-checkpoints mode
 
 
@@ -77,12 +78,25 @@ def test_render_eval_air_config_single_tag(tmp_path, monkeypatch, grid):
     out = run_sweep.render_eval_air_config(grid, "lr2e-6_ep5")
     cfg = yaml.safe_load(out.read_text())
 
-    assert out.name == "eval_lr2e-6_ep5.yaml"
+    assert out.name == "eval_val_lr2e-6_ep5.yaml"
     assert "--tag lr2e-6_ep5" in cfg["command"]
+    assert "--split val" in cfg["command"]
     # eval never inherits axolotl's telemetry export
     assert "AXOLOTL_DO_NOT_TRACK" not in cfg["command"]
     # the $CODE resolver (AppleDouble ._ workaround) is present
     assert 'CODE="$CODE_SOURCE_PATH"' in cfg["command"]
+
+
+def test_render_eval_air_config_test_split(tmp_path, monkeypatch, grid):
+    # The held-out final eval on the winner: split=test -> distinct filename + --split test.
+    monkeypatch.setattr(run_sweep, "GENERATED", tmp_path)
+    out = run_sweep.render_eval_air_config(grid, "lr2e-6_ep5", "test")
+    cfg = yaml.safe_load(out.read_text())
+
+    assert out.name == "eval_test_lr2e-6_ep5.yaml"
+    assert "--split test" in cfg["command"]
+    assert "--tag lr2e-6_ep5" in cfg["command"]
+    assert cfg["mlflow_run_name"] == "cli_eval_test_lr2e-6_ep5"
 
 
 # --- train spec renderer -----------------------------------------------------
@@ -125,20 +139,43 @@ def test_render_axolotl_config_overrides(tmp_path, monkeypatch, grid):
 
 
 # --- subprocess-backed helpers (mocked; no CLI / network) --------------------
-def test_completed_tags_keys_off_config_json(monkeypatch, grid):
-    out_dir = grid["checkpoints_dir"]     # checkpoints live under checkpoints_dir now
+def test_completed_tags_keys_off_weight_marker_not_config_json(monkeypatch, grid):
+    # A cell is DONE only when the WEIGHTS are fully written. config.json alone is a
+    # half-saved checkpoint (save_pretrained writes config.json BEFORE the shards), so
+    # it must NOT count — that mid-save false-positive is what broke eval in the field.
+    out_dir = grid["checkpoints_dir"]
 
     def fake_run(cmd, capture_output, text):
         path = cmd[3]  # dbfs:<...>
         if path == f"dbfs:{out_dir}":
             return SimpleNamespace(returncode=0, stdout="lr2e-6_ep5\nlr1e-6_ep3\n")
         if path.endswith("/lr2e-6_ep5"):
-            return SimpleNamespace(returncode=0, stdout="config.json\nmodel.safetensors\n")
-        return SimpleNamespace(returncode=0, stdout="model.safetensors\n")  # no config.json
+            # complete: shards + the index written last
+            return SimpleNamespace(
+                returncode=0,
+                stdout="config.json\nmodel-00001-of-00002.safetensors\n"
+                       "model-00002-of-00002.safetensors\nmodel.safetensors.index.json\n")
+        # mid-save: config.json + a partial shard, but NO index marker yet
+        return SimpleNamespace(returncode=0,
+                               stdout="config.json\nmodel-00001-of-00002.safetensors\n")
 
     monkeypatch.setattr(run_sweep.subprocess, "run", fake_run)
     done = run_sweep.completed_tags(grid, "prof")
-    assert done == {"lr2e-6_ep5"}                    # only the one with config.json
+    assert done == {"lr2e-6_ep5"}                    # only the one whose weights are complete
+
+
+def test_completed_tags_single_shard_safetensors_is_done(monkeypatch, grid):
+    # An unsharded model has no index.json — the single model.safetensors is the marker.
+    out_dir = grid["checkpoints_dir"]
+
+    def fake_run(cmd, capture_output, text):
+        path = cmd[3]
+        if path == f"dbfs:{out_dir}":
+            return SimpleNamespace(returncode=0, stdout="lr2e-6_ep5\n")
+        return SimpleNamespace(returncode=0, stdout="config.json\nmodel.safetensors\n")
+
+    monkeypatch.setattr(run_sweep.subprocess, "run", fake_run)
+    assert run_sweep.completed_tags(grid, "prof") == {"lr2e-6_ep5"}
 
 
 def test_completed_tags_empty_on_ls_error(monkeypatch, grid):
@@ -201,7 +238,7 @@ def test_submit_no_idem_key_and_dry_run(monkeypatch, tmp_path, grid):
 # --- run_eval orchestration --------------------------------------------------
 def _eval_args(**over):
     base = dict(only="", print_only=False, dry_run=True, serialize_start=False,
-                max_active=1, profile="p", watch=False, idem_suffix="")
+                max_active=1, profile="p", watch=False, idem_suffix="", split="val")
     base.update(over)
     return SimpleNamespace(**base)
 
@@ -232,7 +269,25 @@ def test_run_eval_idem_suffix_forces_key(monkeypatch, tmp_path, grid):
     captured = {}
     monkeypatch.setattr(run_sweep, "submit", _capture_submit(captured))
     run_sweep.run_eval(grid, _eval_args(only="lr2e-6_ep5", idem_suffix="v2"))
-    assert captured["args"][-1] == "qwen-sweep-eval-lr2e-6_ep5-v2"
+    assert captured["args"][-1] == "qwen-sweep-eval-val-lr2e-6_ep5-v2"    # split in the key
+
+
+def test_run_eval_test_split_requires_only(grid):
+    # A bare `--eval --split test` (no --only) would score the whole grid on test and
+    # re-open the selection-on-test leak — must fail loudly instead.
+    assert run_sweep.run_eval(grid, _eval_args(split="test", only="")) == 1
+
+
+def test_run_eval_test_split_generates_test_config(monkeypatch, tmp_path, grid):
+    monkeypatch.setattr(run_sweep, "GENERATED", tmp_path)
+    captured = {}
+    monkeypatch.setattr(run_sweep, "submit", _capture_submit(captured))
+    rc = run_sweep.run_eval(grid, _eval_args(split="test", only="lr2e-6_ep5",
+                                             idem_suffix="v2"))
+    assert rc == 0
+    cfg_path = captured["args"][0]            # eval_cfg is submit()'s first arg
+    assert cfg_path.name == "eval_test_lr2e-6_ep5.yaml"
+    assert captured["args"][-1] == "qwen-sweep-eval-test-lr2e-6_ep5-v2"
 
 
 def test_run_eval_print_only_does_not_submit(monkeypatch, tmp_path, grid):
@@ -363,8 +418,8 @@ def test_pick_best_keeps_latest_eval_per_tag(monkeypatch, grid, capsys):
     assert "2 of 3 runs" in out                 # 3 runs collapsed to 2 tags
     # latest-per-tag = {lrX: 0.30, lrY: 0.50} -> lrY wins. Without the dedup, the stale
     # lrX@0.90 would be the global max and win instead.
-    assert "Winner: lrY" in out
-    assert "Winner: lrX" not in out
+    assert "Winner (by val F1): lrY" in out
+    assert "Winner (by val F1): lrX" not in out
 
 
 def test_pick_best_tolerates_missing_all_f1_column(monkeypatch, grid):

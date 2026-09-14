@@ -210,11 +210,22 @@ display(train_df_cleaned.limit(5))
 # COMMAND ----------
 
 # DBTITLE 1,Cell 20
+# The val table is a SUPERSET so it serves both consumers:
+#   - notebook 01 (training)  reads `prompt` / `response`
+#   - notebook 02 (eval)      reads `file_name` / `raw_ocr_content` / `ground_truths`
+#     (it scores the VALIDATION split for sweep selection, the same way it scores the
+#      test split). `ground_truths` is the same JSON as `response`.
 val_df_cleaned = (
     val_df
     .withColumn("prompt", concat(lit(add_prompt), col("Raw_OCR_Content")))
     .withColumnRenamed("Ground_Truths", "response")
-    .select("prompt", "response")
+    .selectExpr(
+        "prompt",
+        "response",
+        "File_Name as file_name",
+        "response as ground_truths",
+        "Raw_OCR_Content as raw_ocr_content",
+    )
 )
 
 display(val_df_cleaned.limit(5))
