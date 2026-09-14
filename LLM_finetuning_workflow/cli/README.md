@@ -31,13 +31,23 @@ A config-driven **learning-rate × epochs** sweep flow on **AI Runtime + the `ai
   grid cell, 8×H100), **evaluates** (`--eval` → a `GPU_1xH100` vLLM job that scores
   every checkpoint), and **registers** the winner (`--register` → a `GPU_1xH100`
   env_pack job to the UC Model Registry). The loop is `prep → submit train →
-  --status → --eval → --pick-best → --register`, all from your laptop. The eval +
-  register jobs pin `environment.version: databricks_ai_v5` (see
+  --status → --eval (val) → --pick-best → --eval --split test --only <winner> →
+  --register`, all from your laptop. The eval + register jobs pin
+  `environment.version: databricks_ai_v5` (see
   [CLI vLLM eval on a FIPS workspace](#cli-vllm-eval-on-a-fips-workspace)).
+- **Selection on val, reporting on test — three splits, three jobs.** `prep_data.py`
+  writes `train/val/test.jsonl` (85/5/10). Training computes loss on train + val
+  (val drives Axolotl's in-run checkpoint keeping). The **sweep is ranked on the
+  validation set**: `--eval` defaults to `--split val` and logs `stage=eval` runs
+  that `--pick-best` ranks, so the winner is chosen on val and the **test set is
+  never used for selection**. The unbiased **held-out test F1** is measured **once**
+  on the winner with `--eval --split test --only <tag>` (logged `stage=test`, which
+  `--pick-best` ignores). This avoids the optimistic bias of selecting *and* reporting
+  on the same set.
 - **Train vs. eval are two phases, not interleaved.** You train the grid, then eval
   whatever checkpoints exist (you can eval a partial sweep). The winner is chosen by
-  held-out **eval F1**, not train loss (loss sits near ~0.02 here — rigid JSON
-  extraction — and is not a quality signal).
+  **validation F1** (`--eval --split val`), not train loss — loss sits near ~0.02 here
+  (rigid JSON extraction) and is not a quality signal.
 
 ## Layout
 
@@ -55,7 +65,7 @@ LLM_finetuning_workflow/cli/
 ├── scripts/                 # everything runs on your LAPTOP
 │   ├── prep_data.py         # raw CSV → ChatML train/val/test.jsonl → upload to UC Volume  (no Spark)
 │   ├── run_sweep.py         # expand grid, submit TRAIN + EVAL + REGISTER, --status/--resume/--eval/--pick-best/--register
-│   ├── eval_cli.py          # runs ON the eval GPU worker: local vLLM inference + F1 scoring
+│   ├── eval_cli.py          # runs ON the eval GPU worker: local vLLM inference + F1 scoring (--split val|test)
 │   └── register_model.py    # runs ON a GPU worker: log + register the winner to UC (env_pack)
 ├── lib/                     # pure, Spark-free helpers (unit-tested)
 │   ├── extract_eval.py      # scoring + clean_response() (shared by CLI eval + tests)
@@ -112,14 +122,18 @@ python scripts/run_sweep.py --profile fevm-classic-stable --only lr1e-5_ep4 --wa
 #    GPU quota to run cells in parallel — see "Submission order" below.
 python scripts/run_sweep.py --profile fevm-classic-stable --serialize-start
 
-# 5. Evaluate all trained checkpoints — one GPU_1xH100 vLLM job scores every <checkpoints_dir>/<tag>.
-#    (Smoke-test one first: --eval --only lr1e-5_ep4 --watch.)
+# 5. SELECTION eval — score every <checkpoints_dir>/<tag> on the VALIDATION set
+#    (one GPU_1xH100 vLLM job, logs stage=eval). (Smoke-test one: --eval --only lr1e-5_ep4 --watch.)
 python scripts/run_sweep.py --profile fevm-classic-stable --eval
 
-# 6. Rank the eval runs by F1 and print the winner (local MLflow query, no GPU).
+# 6. Rank the VALIDATION eval runs by F1 and print the winner (local MLflow query, no GPU).
 python scripts/run_sweep.py --profile fevm-classic-stable --pick-best
 
-# 7. Register the winning checkpoint to UC as a vLLM ChatModel (GPU_1xH100, env_pack).
+# 7. HELD-OUT TEST — score the winner ONCE on the test set for the unbiased number
+#    (logs stage=test; --pick-best never ranks this). --split test requires --only.
+python scripts/run_sweep.py --profile fevm-classic-stable --eval --split test --only lr1e-5_ep4
+
+# 8. Register the winning checkpoint to UC as a vLLM ChatModel (GPU_1xH100, env_pack).
 #    Register-only — no serving endpoint. Pass the winner tag explicitly.
 python scripts/run_sweep.py --profile fevm-classic-stable --register --only lr1e-5_ep4
 ```
@@ -178,16 +192,31 @@ vN` forces a fresh submit after a failed cell.
 
 ### Evaluate & pick the winner
 
-Eval is CLI-driven — the same `run_sweep.py`:
+Eval is CLI-driven — the same `run_sweep.py`. **Selection runs on validation; the
+held-out test is scored once on the winner.**
 
-1. `python scripts/run_sweep.py --profile fevm-classic-stable --eval` submits one
-   `GPU_1xH100` job (`configs/eval.air.yaml` + `scripts/eval_cli.py`) that loops over
-   every `<checkpoints_dir>/<tag>/`, runs local vLLM inference over `test.jsonl`, and logs an
-   `eval_<tag>` run tagged `stage=eval` (per-field P/R/F1 + top-8). Add `--only <tag>`
-   to eval a single checkpoint. `--eval` submits fresh every time (no idempotency key),
-   so re-running scores whatever checkpoints currently exist.
-2. `python scripts/run_sweep.py --profile fevm-classic-stable --pick-best` ranks the
-   `stage=eval` runs by F1 (pure MLflow query, no GPU).
+1. **Selection (val).** `python scripts/run_sweep.py --profile fevm-classic-stable
+   --eval` submits one `GPU_1xH100` job (`configs/eval.air.yaml` + `scripts/eval_cli.py`)
+   that loops over every `<checkpoints_dir>/<tag>/`, runs local vLLM inference over
+   **`val.jsonl`** (the `--split val` default), and logs an `eval_<tag>` run tagged
+   `stage=eval` (per-field P/R/F1 + top-8). Add `--only <tag>` to eval a single
+   checkpoint. `--eval` submits fresh every time (no idempotency key), so re-running
+   scores whatever checkpoints currently exist.
+2. **Rank (val).** `python scripts/run_sweep.py --profile fevm-classic-stable
+   --pick-best` ranks the `stage=eval` (validation) runs by F1 (pure MLflow query, no
+   GPU) and prints the winner plus the exact held-out-test and register commands. It
+   never ranks `stage=test` runs.
+3. **Report (held-out test).** `python scripts/run_sweep.py --profile
+   fevm-classic-stable --eval --split test --only <winner>` scores the winning
+   checkpoint **once** on `test.jsonl` and logs it tagged `stage=test`. This is the
+   unbiased number to report — because the winner was chosen on val, its val F1 is an
+   optimistic (max-over-grid) estimate. `--split test` requires an explicit `--only`
+   (the test set scores the one winner, not the whole grid).
+
+Why split them: selecting *and* reporting on the same set makes the reported F1
+optimistically biased (you keep the max over the grid). Choosing the winner on val and
+measuring test once keeps the test estimate honest. See
+[the split rationale](#data-splits-train-val-test).
 
 ### Register the winner
 
@@ -252,6 +281,28 @@ means opencv's vendored OpenSSL is back; check the image version first.
 > empty block with `{%- else %}`, not the `{%- endif %}` a string-replace looks for), so
 > `clean_response()` is the fix, applied in `eval_cli.py`'s inference loop.
 
+
+## Data splits: train, val, test
+
+`prep_data.py` writes an 85/5/10 `train/val/test.jsonl`, each with a distinct job:
+
+| Split | File | Consumed by | Metric | Role |
+| --- | --- | --- | --- | --- |
+| Train | `train.jsonl` | training job (Axolotl, 8×H100) | training loss | fit the weights |
+| Val | `val.jsonl` | training job (`eval_strategy: epoch`) **and** `--eval --split val` | eval loss (in-run) + **validation F1** (`stage=eval`) | in-run checkpoint keeping **and** cross-sweep **selection** (`--pick-best`) |
+| Test | `test.jsonl` | `--eval --split test --only <winner>` | **test F1** (`stage=test`) | **held-out reporting**, scored once on the winner |
+
+The rule: **select on val, report on test.** Ranking the sweep on the same set you
+report would make the headline F1 optimistically biased (it's the max over the grid,
+so it partly fits the noise of that set). Choosing the winner by validation F1 and
+then measuring the test set exactly once, on that winner, keeps the reported number an
+unbiased estimate of generalization. `stage=eval` (val) and `stage=test` are kept on
+separate MLflow stages so `--pick-best` can only ever rank the validation runs.
+
+> One thing the split ratios don't guarantee: **independence across splits.**
+> `prep_data.py` splits by row, so near-duplicate documents or the same
+> customer/template appearing in both train and test would inflate F1 regardless of
+> the val/test discipline. If your corpus has such structure, dedup before splitting.
 
 ## Resize the sweep
 

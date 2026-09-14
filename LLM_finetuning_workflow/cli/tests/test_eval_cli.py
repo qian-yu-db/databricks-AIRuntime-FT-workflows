@@ -145,6 +145,50 @@ def test_evaluate_tags_skips_failing_checkpoint(monkeypatch):
     assert by_tag["good2"]["all_f1"] == 0.9        # batch continued past 'bad'
 
 
+def _capturing_mlflow(rec):
+    """A fake mlflow that records the tags + params of the (single) started run."""
+    m = types.ModuleType("mlflow")
+    m.set_experiment = lambda e: None
+
+    class _Run:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    m.start_run = lambda run_name=None: (rec.__setitem__("run_name", run_name) or _Run())
+    m.log_param = lambda k, v: rec.setdefault("params", {}).__setitem__(k, v)
+    m.set_tags = lambda t: rec.setdefault("tags", {}).update(t)
+    m.log_metrics = lambda *a, **k: None
+    return m
+
+
+@pytest.mark.parametrize("split,stage", [("val", "eval"), ("test", "test")])
+def test_evaluate_tags_stage_follows_split(monkeypatch, split, stage):
+    # The crux of the val/test fix: split=val logs stage=eval (what --pick-best ranks),
+    # split=test logs stage=test (the held-out final), so ranking never sees a test run.
+    rec = {}
+    monkeypatch.setitem(sys.modules, "mlflow", _capturing_mlflow(rec))
+    monkeypatch.setattr(eval_cli, "eval_one",
+                        lambda *a: ({"f1": 0.9, "precision": 0.9, "recall": 0.9}, {"f1": 0.8}, 5, 0))
+    args = SimpleNamespace(experiment="/Users/me@databricks.com/exp", split=split)
+    eval_cli.evaluate_tags(["lr2e-6_ep5"], "/out", [], args)
+
+    assert rec["tags"]["stage"] == stage
+    assert rec["params"]["eval_split"] == split
+    assert rec["run_name"] == f"{stage}_lr2e-6_ep5"
+
+
+def test_evaluate_tags_defaults_to_val_stage_when_split_absent(monkeypatch):
+    # Back-compat: args without a `split` attr must not crash and defaults to val/eval.
+    rec = {}
+    monkeypatch.setitem(sys.modules, "mlflow", _capturing_mlflow(rec))
+    monkeypatch.setattr(eval_cli, "eval_one",
+                        lambda *a: ({"f1": 0.9, "precision": 0.9, "recall": 0.9}, {"f1": 0.8}, 5, 0))
+    args = SimpleNamespace(experiment="/Users/me@databricks.com/exp")   # no split attr
+    eval_cli.evaluate_tags(["t"], "/out", [], args)
+    assert rec["tags"]["stage"] == "eval"
+    assert rec["params"]["eval_split"] == "val"
+
+
 def test_evaluate_tags_lets_programming_errors_propagate(monkeypatch):
     # A KeyError/AttributeError is a bug, not a checkpoint failure — it must crash,
     # not be swallowed as a skipped checkpoint (narrowed except: RuntimeError/OSError).

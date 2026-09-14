@@ -48,15 +48,16 @@ code_source:
 
 # $CODE_SOURCE_PATH is where the snapshot lands. run_sweep.py OVERWRITES this
 # command per-eval: it prepends the shared $CODE resolver (the AppleDouble `._`
-# workaround) and calls scripts/eval_cli.py with --data-dir (test.jsonl),
-# --checkpoints-dir (the weights), an ABSOLUTE --experiment path, and (for a
-# single-cell eval) --tag. eval_cli.py imports lib/extract_eval.py from $CODE/lib.
-# For a MANUAL run, replace the placeholders:
+# workaround) and calls scripts/eval_cli.py with --data-dir, --checkpoints-dir (the
+# weights), an ABSOLUTE --experiment path, --split (val for selection -> stage=eval,
+# or test for the held-out final -> stage=test), and (for a single-cell eval) --tag.
+# eval_cli.py reads <data-dir>/<split>.jsonl and imports lib/extract_eval.py from
+# $CODE/lib. For a MANUAL run, replace the placeholders:
 #   --data-dir <grid.yaml data_dir>  --checkpoints-dir <grid.yaml checkpoints_dir>
-#   --experiment <grid.yaml mlflow_experiment_path>
+#   --experiment <grid.yaml mlflow_experiment_path>  --split <val|test>
 #   [--tag <checkpoint tag>]   (drop --tag to eval every checkpoint under checkpoints_dir)
 command: |
-  python -u $CODE_SOURCE_PATH/scripts/eval_cli.py --data-dir PLACEHOLDER_DATA_DIR --checkpoints-dir PLACEHOLDER_CHECKPOINTS_DIR --experiment PLACEHOLDER_EXPERIMENT_PATH --tag PLACEHOLDER_TAG
+  python -u $CODE_SOURCE_PATH/scripts/eval_cli.py --data-dir PLACEHOLDER_DATA_DIR --checkpoints-dir PLACEHOLDER_CHECKPOINTS_DIR --experiment PLACEHOLDER_EXPERIMENT_PATH --split val --tag PLACEHOLDER_TAG
 
 max_retries: 0
 timeout_minutes: 120

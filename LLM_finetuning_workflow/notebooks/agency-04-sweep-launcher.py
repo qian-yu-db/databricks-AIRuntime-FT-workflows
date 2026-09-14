@@ -99,7 +99,9 @@ else:
 submitted_runs = []
 
 for combo in SWEEP_GRID:
-    params = {**combo, "experiment_path": EXPERIMENT_PATH}
+    # eval_split=val: each cell's eval task scores the VALIDATION set (stage=eval), so
+    # the ranking below selects on val and the test set is never used for selection.
+    params = {**combo, "experiment_path": EXPERIMENT_PATH, "eval_split": "val"}
     run = w.jobs.run_now(job_id=JOB_ID, job_parameters=params)
     submitted_runs.append({"run_id": run.run_id, **combo})
     print(f"✓ Submitted: lr={combo['learning_rate']}, epochs={combo['num_epochs']} → run_id={run.run_id}")
@@ -160,17 +162,19 @@ wait_for_runs(submitted_runs)
 
 # COMMAND ----------
 
-# DBTITLE 1,Collect eval results & find best checkpoint
+# DBTITLE 1,Collect VALIDATION eval results & find best checkpoint
 import mlflow
 import pandas as pd
 
-# Query MLflow for all eval runs logged by the sweep job's eval task
+# Query MLflow for the VALIDATION eval runs (stage=eval) logged by the sweep job's eval
+# task. This is selection: the winner is chosen on val, so the held-out test set stays
+# untouched. Notebook 05 measures the unbiased test F1 once, on this winner (stage=test).
 experiment = mlflow.get_experiment_by_name(EXPERIMENT_PATH)
 assert experiment, f"Experiment '{EXPERIMENT_PATH}' not found — has the sweep run at least once?"
 
 runs_df = mlflow.search_runs(
     experiment_ids=[experiment.experiment_id],
-    filter_string="tags.stage = 'eval'",
+    filter_string="tags.stage = 'eval'",   # val selection runs only — NOT stage=test
 )
 
 if runs_df.empty:
@@ -193,14 +197,17 @@ else:
     if "all_f1" in ranking.columns:
         ranking = ranking.sort_values("all_f1", ascending=False).reset_index(drop=True)
 
-    print("=== Sweep eval ranking (latest eval per tag, by all_f1) ===")
+    print("=== Sweep VALIDATION ranking (stage=eval, latest eval per tag, by all_f1) ===")
     display(spark.createDataFrame(ranking))
 
     best = ranking.iloc[0]
-    print(f"\n🏆 Best checkpoint: {best.get('checkpoint_tag', 'N/A')}")
+    print(f"\n🏆 Best checkpoint (by VALIDATION F1): {best.get('checkpoint_tag', 'N/A')}")
     print(f"   lr={best.get('learning_rate', '?')}, epochs={best.get('num_epochs', '?')}")
-    print(f"   all_f1={best.get('all_f1', float('nan')):.4f}  top8_f1={best.get('top8_f1', 0):.4f}")
+    print(f"   val all_f1={best.get('all_f1', float('nan')):.4f}  val top8_f1={best.get('top8_f1', 0):.4f}")
     print(f"   Model path: /Volumes/fins_genai/fine_tuning/checkpoints/agency-ft-final-{best.get('checkpoint_tag', '')}")
+    print(f"\n   These are VALIDATION metrics (selection-biased — max over the grid). Enter this")
+    print(f"   checkpoint_tag into notebook 05 to register/deploy and measure the unbiased,")
+    print(f"   held-out TEST F1 once on this winner (logged stage=test).")
 
 # COMMAND ----------
 

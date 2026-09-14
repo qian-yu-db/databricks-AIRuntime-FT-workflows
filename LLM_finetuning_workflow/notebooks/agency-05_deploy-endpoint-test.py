@@ -59,6 +59,9 @@ dbutils.widgets.text("catalog", "fins_genai", "Catalog")
 dbutils.widgets.text("schema", "fine_tuning", "Schema")
 dbutils.widgets.text("volume", "training_data", "Volume")
 dbutils.widgets.text("volume_model", "checkpoints", "Volume Model")
+# Same experiment as the sweep so the held-out TEST result (stage=test) lands next to
+# the winner's VALIDATION selection run (stage=eval) for a side-by-side comparison.
+dbutils.widgets.text("experiment_path", "/Users/q.yu@databricks.com/mlflow_experiments/agency-finetuning-ai-runtime-sweep", "MLflow Experiment Path")
 
 
 CHECKPOINT_TAG = dbutils.widgets.get("checkpoint_tag")
@@ -66,6 +69,7 @@ CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
 VOLUME = dbutils.widgets.get("volume")
 VOLUME_MODEL = dbutils.widgets.get("volume_model")
+EXPERIMENT_PATH = dbutils.widgets.get("experiment_path")
 
 # COMMAND ----------
 
@@ -115,8 +119,18 @@ LOCAL_GPU_NOTE = (
 )
 
 # --- Eval data / prompt -------------------------------------------------------
+# This is the HELD-OUT TEST set — scored ONCE here, on the winning checkpoint chosen by
+# notebook 04 on the validation set. It is never used for model selection, so this F1 is
+# the unbiased number to report.
 TEST_TABLE = f"{CATALOG}.{SCHEMA}.agency_ft_dataset_test_v3"
 OUTPUT_TABLE = f"{CATALOG}.{SCHEMA}.agency_inference_output_qwen3_vllm"
+
+# High-priority field subset (matches notebook 02 / the CLI eval) for comparable top8.
+TOP_8_FIELDS = [
+    "PolicyNumber", "OwnerFile", "LoanFile",
+    "OwnerPolicyNumber", "OwnerPolicyAmount", "OwnerPolicyDate",
+    "LoanPolicyNumber", "LoanPolicyAmount", "LoanPolicyDate",
+]
 
 # Extraction prompt (same one used during fine-tuning; clean, no [INST] tags). Read from
 # the Volume — the SAME file agency-00 baked into the train/val prompt column — so the
@@ -677,12 +691,50 @@ precision = tp / (tp + fp) if (tp + fp) > 0 else 0
 recall = tp / (tp + fn) if (tp + fn) > 0 else 0
 f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
-print(f"=== Overall Metrics ===")
+print(f"=== Overall Metrics (HELD-OUT TEST) ===")
 print(f"  Precision: {precision:.4f}")
 print(f"  Recall:    {recall:.4f}")
 print(f"  F1 Score:  {f1:.4f}")
 print(f"  TP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}")
 print(f"  Total fields evaluated: {len(merged)}")
+
+# Top-8 high-priority fields only (same subset as notebook 02 / the CLI eval).
+_t8 = merged[merged['field'].isin(TOP_8_FIELDS)]
+t8_tp = (_t8['result'] == 'TP').sum()
+t8_fp = (_t8['result'] == 'FP').sum()
+t8_fn = (_t8['result'] == 'FN').sum()
+top8_precision = t8_tp / (t8_tp + t8_fp) if (t8_tp + t8_fp) > 0 else 0
+top8_recall = t8_tp / (t8_tp + t8_fn) if (t8_tp + t8_fn) > 0 else 0
+top8_f1 = 2 * top8_precision * top8_recall / (top8_precision + top8_recall) if (top8_precision + top8_recall) > 0 else 0
+print(f"  Top-8 F1: {top8_f1:.4f}  (P {top8_precision:.4f} / R {top8_recall:.4f})")
+
+# COMMAND ----------
+
+# DBTITLE 1,Log HELD-OUT TEST metrics to MLflow (stage=test)
+# The unbiased final number: this checkpoint was selected on VALIDATION (notebook 04),
+# so scoring the held-out TEST set here — once, on the winner — is what you report.
+# Tagged stage=test (NOT stage=eval) so it never mixes into the sweep's val ranking; it
+# lands in the same experiment as the winner's stage=eval run for a side-by-side view.
+import mlflow
+
+mlflow.set_experiment(EXPERIMENT_PATH)
+with mlflow.start_run(run_name=f"test_{CHECKPOINT_TAG}") as _test_run:
+    mlflow.log_metrics({
+        "all_precision": float(precision), "all_recall": float(recall), "all_f1": float(f1),
+        "top8_precision": float(top8_precision), "top8_recall": float(top8_recall),
+        "top8_f1": float(top8_f1),
+    })
+    mlflow.log_params({
+        "eval_split": "test",
+        "eval_table": TEST_TABLE,
+        "checkpoint_tag": CHECKPOINT_TAG,
+        "uc_model_name": UC_MODEL_NAME,
+        "inference": "serving_endpoint_ai_query",
+        "matching_threshold": 0.6,
+        "documents_scored": int(merged['File_Name'].nunique()) if 'File_Name' in merged.columns else len(merged),
+    })
+    mlflow.set_tags({"approach": "held-out-test", "stage": "test"})
+    print(f"Held-out TEST metrics logged (stage=test) to run {_test_run.info.run_id}")
 
 # COMMAND ----------
 
