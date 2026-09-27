@@ -67,7 +67,7 @@ Leave `base_model`, `gpu_type`, `max_seq_length`, `per_device_batch_size`, `grad
 
 ### peft-02 — Merge + validation eval (`peft-02_merge-and-val-eval`)
 
-- Loads the **bf16** Instruct base (also for `qlora_4bit` adapters), applies the adapter, `merge_and_unload()`, saves `agency-peft-merged-{run_tag}`. Skips the merge if it already exists.
+- Loads the **bf16** Instruct base (also for `qlora_4bit` adapters), applies the adapter, `merge_and_unload()`, saves `agency-peft-merged-{run_tag}` plus a `.merged_from_adapter` marker (adapter sha256, written last). Re-merges automatically if the adapter was retrained under the same `run_tag` or a previous copy was interrupted. The tokenizer is loaded from the merge base (not the adapter dir, which was written by notebook 01's newer transformers) and its chat template is compared with the adapter's.
 - Checks the merge base matches the training base, and compares merged vs. unmerged greedy output (small drift is expected and only warned).
 - Local vLLM on the **val** split → field-level metrics → MLflow `stage=eval`, plus `json_parse_failures` and `inference_errors`.
 - On A10 keep `max_num_seqs=2`; raise it on H100 for throughput.
@@ -76,7 +76,7 @@ Leave `base_model`, `gpu_type`, `max_seq_length`, `per_device_batch_size`, `grad
 
 - Local vLLM smoke test (the real pre-deploy check — `predict` is a stub for custom-entrypoint models).
 - MLflow `ChatModel` + vLLM `metadata.entrypoint` + `env_pack="databricks_model_serving"` → UC (20–30 min to READY). Set `model_version` to redeploy an existing version without re-registering.
-- Creates/updates the endpoint (`workload_type` `GPU_LARGE` default, `GPU_MEDIUM` = A10), then `ai_query` over the **test** split → MLflow `stage=test`.
+- Creates/updates the endpoint (`workload_type` `GPU_LARGE` default, `GPU_MEDIUM` = A10), then `ai_query` (`failOnError => false`) over the **test** split → MLflow `stage=test`. A failed row is counted in `inference_errors` and scored as FN instead of aborting the run. Refuses to deploy a merged checkpoint whose marker doesn't match the current adapter.
 
 ---
 
@@ -134,6 +134,8 @@ Then set `base_model` (peft-01) and `merge_base_model` (peft-02) to those `/Volu
 | High `json_parse_failures` | Output truncated at `max_new_tokens`, or model not stopping | Check the masking asserts passed; check `dropped_overlength_train` (A10) — consider `lora_bf16` |
 | Masking assert fails before training | Template / BOS / tokenizer mismatch | Do not train; inspect the printed masked/supervised spans |
 | Model download fails (401/403 or network) | Gated repo or blocked egress | Use the `unsloth/*` mirrors (no token), or pre-stage on a Volume (above); tokens only via `dbutils.secrets` |
+| Val F1 looks like an older model / vLLM "ready" instantly | A vLLM server from an earlier interrupted run still holds port 3080 | Notebooks now `pkill` it before launch and assert the port is free; if the assert fires, run `pkill -f vllm.entrypoints.openai.api_server` in a `%sh` cell |
+| `... was merged from an older adapter` assert in 03 | Adapter retrained after the last merge | Re-run notebook 02 for that `run_tag` |
 | `TimeoutError` waiting for READY | `env_pack` failed silently | Re-run the registration cell (new version) |
 | OOM (exit 137) during registration | `env_pack` on CPU compute | Run notebook 03 on Serverless GPU |
 | Endpoint disappeared overnight | GPU endpoints without scale-to-zero are cleaned up | Re-run notebook 03 with `model_version` set (no re-registration) |

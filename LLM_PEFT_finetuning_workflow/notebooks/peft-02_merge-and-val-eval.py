@@ -97,7 +97,9 @@ MAX_NUM_SEQS = int(dbutils.widgets.get("max_num_seqs"))
 GPU_MEMORY_UTILIZATION = float(dbutils.widgets.get("gpu_memory_utilization"))
 REQUEST_TIMEOUT = int(dbutils.widgets.get("request_timeout"))
 MAX_WORKERS = 4
-OCR_CHAR_CAP = 100000  # far-out failsafe (~25k tokens), same as FFT
+# Same cap as FFT. NOT a failsafe at MAX_MODEL_LEN=20480: a doc that long makes vLLM reject the
+# request (HTTP 400) -> counted in inference_errors and scored as FN.
+OCR_CHAR_CAP = 100000
 
 EVAL_SPLIT = dbutils.widgets.get("eval_split").strip()
 assert EVAL_SPLIT in {"val", "test"}, f"eval_split must be 'val' or 'test', got {EVAL_SPLIT!r}"
@@ -154,8 +156,9 @@ else:
 
 # COMMAND ----------
 
-# DBTITLE 1,Merge the adapter into the bf16 base (skipped if already merged)
+# DBTITLE 1,Merge the adapter into the bf16 base (skipped if already merged from THIS adapter)
 import gc
+import hashlib
 import shutil
 
 import pyspark.sql.functions as F
@@ -165,13 +168,55 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-if os.path.isfile(os.path.join(MERGED_DIR, "config.json")):
-    print(f"Merged checkpoint already exists at {MERGED_DIR} — staging it to local disk.")
+
+def adapter_fingerprint(adapter_dir):
+    """sha256 of the adapter weights — changes whenever notebook 01 retrains this run_tag."""
+    h = hashlib.sha256()
+    with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def merged_is_current(merged_dir, adapter_dir):
+    """True only for a COMPLETE merge of THIS adapter (the marker is written after the copy)."""
+    marker = os.path.join(merged_dir, ".merged_from_adapter")
+    if not os.path.isfile(marker):
+        return False
+    with open(marker) as f:
+        return f.read().strip() == adapter_fingerprint(adapter_dir)
+
+
+def adapter_chat_template(adapter_dir):
+    """Chat template saved with the adapter, read as raw text (no cross-version tokenizer load)."""
+    jinja = os.path.join(adapter_dir, "chat_template.jinja")
+    if os.path.isfile(jinja):
+        with open(jinja) as f:
+            return f.read()
+    cfg = os.path.join(adapter_dir, "tokenizer_config.json")
+    if os.path.isfile(cfg):
+        with open(cfg) as f:
+            return json.load(f).get("chat_template")
+    return None
+
+
+if merged_is_current(MERGED_DIR, ADAPTER_DIR):
+    print(f"Merged checkpoint at {MERGED_DIR} matches this adapter — staging it to local disk.")
     shutil.copytree(MERGED_DIR, LOCAL_MERGED, dirs_exist_ok=True)
 else:
-    # Tokenizer from the adapter dir (carries chat template + pad token); re-saved below by
-    # THIS env's transformers so vLLM reads a tokenizer written by the version it runs (G2).
-    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_DIR)
+    if os.path.isdir(MERGED_DIR):
+        print(f"{MERGED_DIR} is stale (adapter retrained) or incomplete — it will be replaced.")
+    # Tokenizer from the merge base, NOT the adapter dir: the adapter's tokenizer files were written
+    # by notebook 01's newer transformers and may not load under 4.57.6 (spec G2). It is the same
+    # Llama 3.1 Instruct tokenizer; the chat templates are compared below.
+    tokenizer = AutoTokenizer.from_pretrained(MERGE_BASE_MODEL)
+    _adapter_template = adapter_chat_template(ADAPTER_DIR)
+    if _adapter_template is None:
+        print("WARNING: no chat template found in the adapter dir — cannot compare with the merge base's.")
+    elif _adapter_template.strip() != (tokenizer.chat_template or "").strip():
+        print("WARNING: the adapter's chat template differs from the merge base's — training and serving "
+              "prompts may not match. Inspect both before trusting the eval.")
+    _pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     base = AutoModelForCausalLM.from_pretrained(MERGE_BASE_MODEL, torch_dtype=torch.bfloat16, device_map="cuda")
     peft_model = PeftModel.from_pretrained(base, ADAPTER_DIR)  # uses `base`, ignores adapter's 4-bit base id
     peft_model.eval()
@@ -192,7 +237,7 @@ else:
 
     def greedy(m):
         with torch.no_grad():
-            out = m.generate(_input_ids, max_new_tokens=256, do_sample=False, pad_token_id=tokenizer.pad_token_id)
+            out = m.generate(_input_ids, max_new_tokens=256, do_sample=False, pad_token_id=_pad_id)
         return tokenizer.decode(out[0, _input_ids.shape[1]:], skip_special_tokens=True)
 
     unmerged_out = greedy(peft_model)  # BEFORE merge_and_unload (it mutates the model)
@@ -211,7 +256,12 @@ else:
     merged.save_pretrained(LOCAL_MERGED, safe_serialization=True, max_shard_size="5GB")
     tokenizer.save_pretrained(LOCAL_MERGED)
     print(f"Copying merged checkpoint -> {MERGED_DIR} (~16 GB) ...")
+    if os.path.isdir(MERGED_DIR):
+        shutil.rmtree(MERGED_DIR)  # stale/partial merge of this run_tag — never mix shards
     shutil.copytree(LOCAL_MERGED, MERGED_DIR, dirs_exist_ok=True)
+    # Marker LAST: its presence means the copy completed, its content names the adapter merged.
+    with open(os.path.join(MERGED_DIR, ".merged_from_adapter"), "w") as f:
+        f.write(adapter_fingerprint(ADAPTER_DIR))
 
     # Free the GPU for vLLM.
     del merged, peft_model, base, _input_ids
@@ -248,10 +298,31 @@ print(entrypoint(LOCAL_PORT))
 # COMMAND ----------
 
 # DBTITLE 1,Start local vLLM server and wait for /health
+import socket
 import subprocess
 import time
 
 import requests
+
+
+def ensure_port_free(port, timeout=60):
+    """Fail if something still holds `port` (e.g. a vLLM server left over from an earlier run)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return
+        time.sleep(1)
+    raise AssertionError(
+        f"Port {port} is still in use — a previous vLLM server may be running. "
+        "Run `pkill -f vllm.entrypoints.openai.api_server` in a %sh cell and retry."
+    )
+
+
+# A vLLM server from an earlier failed/interrupted run survives %restart_python (own session);
+# if it still held the port, /health would report the OLD model as ready and it would be scored.
+subprocess.run(["pkill", "-f", "vllm.entrypoints.openai.api_server"])
+ensure_port_free(LOCAL_PORT)
 
 log_path = os.path.join(workdir, "vllm.log")
 log_fh = open(log_path, "w")

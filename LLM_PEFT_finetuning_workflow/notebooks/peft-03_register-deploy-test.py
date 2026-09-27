@@ -113,10 +113,33 @@ print(f"run_tag={RUN_TAG}\nweights: {MERGED_DIR}\nUC model: {UC_MODEL_NAME}\nend
 # COMMAND ----------
 
 # DBTITLE 1,Stage merged weights from the Volume to local disk
+import hashlib
 import shutil
 
-assert os.path.isfile(os.path.join(MERGED_DIR, "config.json")), (
-    f"No merged checkpoint at {MERGED_DIR} — run notebook 02 for run_tag={RUN_TAG} first."
+ADAPTER_DIR = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME_MODEL}/agency-peft-adapter-{RUN_TAG}"
+
+
+def adapter_fingerprint(adapter_dir):
+    """sha256 of the adapter weights — changes whenever notebook 01 retrains this run_tag."""
+    h = hashlib.sha256()
+    with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def merged_is_current(merged_dir, adapter_dir):
+    """True only for a COMPLETE merge of THIS adapter (notebook 02 writes the marker after the copy)."""
+    marker = os.path.join(merged_dir, ".merged_from_adapter")
+    if not os.path.isfile(marker):
+        return False
+    with open(marker) as f:
+        return f.read().strip() == adapter_fingerprint(adapter_dir)
+
+
+assert merged_is_current(MERGED_DIR, ADAPTER_DIR), (
+    f"{MERGED_DIR} is missing, incomplete, or was merged from an older adapter for run_tag={RUN_TAG}. "
+    "Run notebook 02 for this run_tag first (it re-merges and re-validates)."
 )
 shutil.copytree(MERGED_DIR, ARTIFACTS_PATH, dirs_exist_ok=True)
 print(f"Staged {len(os.listdir(ARTIFACTS_PATH))} files in {ARTIFACTS_PATH}/")
@@ -147,10 +170,30 @@ print("serving:", entrypoint(SERVING_PORT))
 
 # DBTITLE 1,Local smoke test — start vLLM, one extraction, stop (pre-deploy check, spec G15)
 import signal
+import socket
 import subprocess
 import time
 
 import requests
+
+
+def ensure_port_free(port, timeout=60):
+    """Fail if something still holds `port` (e.g. a vLLM server left over from an earlier run)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return
+        time.sleep(1)
+    raise AssertionError(
+        f"Port {port} is still in use — a previous vLLM server may be running. "
+        "Run `pkill -f vllm.entrypoints.openai.api_server` in a %sh cell and retry."
+    )
+
+
+# A leftover vLLM server (survives %restart_python) would answer /health with the OLD model.
+subprocess.run(["pkill", "-f", "vllm.entrypoints.openai.api_server"])
+ensure_port_free(LOCAL_PORT)
 
 log_path = os.path.join(workdir, "vllm.log")
 proc = subprocess.Popen(
@@ -288,19 +331,31 @@ print(resp.choices[0].message.content[:1500])
 # COMMAND ----------
 
 # DBTITLE 1,Batch inference over the held-out test set with ai_query
+# failOnError => false: one failed row (timeout, 5xx, over-length 400) must not abort the whole
+# run. ai_query then returns struct<result, errorMessage>; failed rows get a NULL model_output,
+# which from_json turns into all-NA -> scored as FN (same as notebook 02's failed requests).
+# LEFT(..., 100000) is the FFT cap; at MAX_MODEL_LEN=20480 a doc that long errors instead.
 escaped_prompt = INSTRUCTION_PROMPT.replace("'", "\\'")
 spark.sql(f"""
 CREATE OR REPLACE TABLE {OUTPUT_TABLE} AS
 SELECT
-  file_name AS File_Name,
-  ai_query(
-    '{ENDPOINT_NAME}',
-    CONCAT('{escaped_prompt}', '\\n', LEFT(raw_ocr_content, 100000)),
-    modelParameters => named_struct('max_tokens', 3500, 'temperature', 0.0)
-  ) AS model_output
-FROM {TEST_TABLE}
+  File_Name,
+  ai_resp.result AS model_output,
+  ai_resp.errorMessage AS error_message
+FROM (
+  SELECT
+    file_name AS File_Name,
+    ai_query(
+      '{ENDPOINT_NAME}',
+      CONCAT('{escaped_prompt}', '\\n', LEFT(raw_ocr_content, 100000)),
+      modelParameters => named_struct('max_tokens', 3500, 'temperature', 0.0),
+      failOnError => false
+    ) AS ai_resp
+  FROM {TEST_TABLE}
+)
 """)
-print(f"Batch inference complete -> {OUTPUT_TABLE}")
+INFERENCE_ERRORS = spark.table(OUTPUT_TABLE).where("error_message IS NOT NULL").count()
+print(f"Batch inference complete -> {OUTPUT_TABLE}  (inference_errors={INFERENCE_ERRORS})")
 display(spark.table(OUTPUT_TABLE).limit(5))
 
 # COMMAND ----------
@@ -481,10 +536,12 @@ def is_json_object(s):
         return False
 
 
+# Only over rows the endpoint answered; failed rows are counted in INFERENCE_ERRORS instead.
 JSON_PARSE_FAILURES = int(sum(
-    not is_json_object(s) for s in spark.table(OUTPUT_TABLE).select("model_output").toPandas()["model_output"]
+    not is_json_object(s)
+    for s in spark.table(OUTPUT_TABLE).where("error_message IS NULL").select("model_output").toPandas()["model_output"]
 ))
-print(f"json_parse_failures={JSON_PARSE_FAILURES}")
+print(f"json_parse_failures={JSON_PARSE_FAILURES}  inference_errors={INFERENCE_ERRORS}")
 
 # COMMAND ----------
 
@@ -535,7 +592,7 @@ mlflow.set_experiment(EXPERIMENT_PATH)
 with mlflow.start_run(run_name=f"test_{RUN_TAG}") as _test_run:
     mlflow.log_metrics({f"all_{k}": v for k, v in overall.items()})
     mlflow.log_metrics({f"top8_{k}": v for k, v in top8.items()})
-    mlflow.log_metrics({"json_parse_failures": JSON_PARSE_FAILURES})
+    mlflow.log_metrics({"json_parse_failures": JSON_PARSE_FAILURES, "inference_errors": INFERENCE_ERRORS})
     mlflow.log_params({
         "eval_split": "test",
         "eval_table": TEST_TABLE,
