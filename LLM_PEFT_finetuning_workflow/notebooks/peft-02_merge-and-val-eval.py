@@ -223,3 +223,408 @@ assert "config.json" in _files and any(f.endswith(".safetensors") for f in _file
     f"Merged checkpoint in {LOCAL_MERGED} is incomplete: {_files}"
 )
 print(f"Merged checkpoint ready locally at {LOCAL_MERGED} ({len(_files)} files); persisted at {MERGED_DIR}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Define the vLLM entrypoint
+def entrypoint(port: int) -> str:
+    args = [
+        "python", "-u", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", LOCAL_MERGED,
+        "--served-model-name", SERVED_MODEL_NAME,
+        "--host", "0.0.0.0",
+        "--port", str(port),
+        "--dtype", "bfloat16",
+        "--max-model-len", str(MAX_MODEL_LEN),
+        "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
+        "--max-num-seqs", str(MAX_NUM_SEQS),
+        "--enable-prefix-caching",  # the ~1.5K-token instruction prompt is shared by every request
+    ]
+    return " ".join(args)
+
+
+print(entrypoint(LOCAL_PORT))
+
+# COMMAND ----------
+
+# DBTITLE 1,Start local vLLM server and wait for /health
+import subprocess
+import time
+
+import requests
+
+log_path = os.path.join(workdir, "vllm.log")
+log_fh = open(log_path, "w")
+proc = subprocess.Popen(
+    ["bash", "-lc", entrypoint(LOCAL_PORT)],
+    stdout=log_fh, stderr=subprocess.STDOUT, start_new_session=True,
+)
+print(f"vLLM starting (pid={proc.pid}) on port {LOCAL_PORT} — polling /health (logs -> {log_path}) ...")
+
+STARTUP_TIMEOUT = 1500
+deadline = time.time() + STARTUP_TIMEOUT
+ready = False
+while time.time() < deadline:
+    if proc.poll() is not None:
+        raise RuntimeError(f"vLLM exited during startup (code {proc.returncode}). See {log_path}.")
+    try:
+        if requests.get(f"http://localhost:{LOCAL_PORT}/health", timeout=2).status_code == 200:
+            ready = True
+            print(f"vLLM is ready after {int(time.time() - (deadline - STARTUP_TIMEOUT))}s.")
+            break
+    except Exception:
+        pass
+    time.sleep(5)
+if not ready:
+    with open(log_path) as f:
+        print("".join(f.readlines()[-120:]))
+    raise RuntimeError(
+        f"vLLM did not become ready within {STARTUP_TIMEOUT}s. On an A10, a KV-cache error means: "
+        "lower max_model_len (e.g. 16384) or raise gpu_memory_utilization slightly."
+    )
+
+# COMMAND ----------
+
+# DBTITLE 1,Smoke test — single extraction request
+sample_ocr = spark.table(EVAL_TABLE).select("raw_ocr_content").limit(1).collect()[0][0]
+resp = requests.post(
+    f"http://localhost:{LOCAL_PORT}/invocations",
+    json={
+        "messages": [{"role": "user", "content": INSTRUCTION_PROMPT + "\n" + sample_ocr}],
+        "max_tokens": MAX_NEW_TOKENS,
+        "temperature": 0.0,
+    },
+    timeout=REQUEST_TIMEOUT,
+)
+resp.raise_for_status()
+print(resp.json()["choices"][0]["message"]["content"][:1500])
+
+# COMMAND ----------
+
+# DBTITLE 1,Batch inference over the eval split (thread-pooled local vLLM)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+docs = (
+    spark.table(EVAL_TABLE)
+    .selectExpr("file_name AS File_Name", "raw_ocr_content AS Raw_OCR_Content")
+    .toPandas()
+    .to_dict("records")
+)
+print(f"Running inference on {len(docs)} {EVAL_SPLIT} documents ...")
+
+
+def infer(row):
+    content = INSTRUCTION_PROMPT + "\n" + row["Raw_OCR_Content"][:OCR_CHAR_CAP]
+    resp = requests.post(
+        f"http://localhost:{LOCAL_PORT}/invocations",
+        json={"messages": [{"role": "user", "content": content}],
+              "max_tokens": MAX_NEW_TOKENS, "temperature": 0.0},
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return {"File_Name": row["File_Name"],
+            "model_output": resp.json()["choices"][0]["message"]["content"]}
+
+
+results, errors = [], []
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    futures = {ex.submit(infer, r): r["File_Name"] for r in docs}
+    for i, fut in enumerate(as_completed(futures), 1):
+        fname = futures[fut]
+        try:
+            results.append(fut.result())
+        except Exception as e:
+            errors.append(fname)  # scored as FN below (left join), never dropped
+            print(f"  ERROR {fname}: {e}")
+        if i % 25 == 0:
+            print(f"  {i}/{len(docs)} done")
+
+print(f"Inference complete: {len(results)} ok, {len(errors)} errors.")
+assert results, "No predictions produced — every inference request failed. See vllm.log."
+
+# COMMAND ----------
+
+# DBTITLE 1,Stop the local vLLM server
+import signal
+
+os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+time.sleep(2)
+print("vLLM stopped.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Persist raw outputs
+import pandas as pd
+
+spark.createDataFrame(pd.DataFrame(results)).write.mode("overwrite").option(
+    "overwriteSchema", "true"
+).saveAsTable(OUTPUT_TABLE)
+print(f"Wrote {len(results)} outputs -> {OUTPUT_TABLE}")
+display(spark.table(OUTPUT_TABLE).limit(5))
+
+# COMMAND ----------
+
+# DBTITLE 1,Evaluation Section
+# MAGIC %md
+# MAGIC ## Evaluation — field-level accuracy (identical to the FFT workflow)
+# MAGIC
+# MAGIC Fuzzy match (SequenceMatcher ratio > 0.6), **left join on ground truth** so a failed
+# MAGIC document counts as FN, mismatch → FP. Plus `json_parse_failures` / `inference_errors`.
+
+# COMMAND ----------
+
+# DBTITLE 1,Parse and flatten outputs
+import difflib
+
+from pyspark.sql.functions import col, from_json
+from pyspark.sql.types import StringType, StructField, StructType
+
+# Copied verbatim from FFT agency-05_deploy-endpoint-test.py — keep in sync with agency_prompt.txt.
+extraction_schema = StructType([
+    StructField('ActualDocTitle', StringType()),
+    StructField('SubType', StringType()),
+    StructField('Type', StringType()),
+    StructField('Scope', StringType()),
+    StructField('TitleCompanyName', StringType()),
+    StructField('Agentname', StringType()),
+    StructField('EstateInterestType', StringType()),
+    StructField('PolicyNumber', StringType()),
+    StructField('OwnerFile', StringType()),
+    StructField('LoanFile', StringType()),
+    StructField('Order', StringType()),
+    StructField('CommitmentNumber', StringType()),
+    StructField('CommitmentEffectiveDate', StringType()),
+    StructField('TitleNumber', StringType()),
+    StructField('FARef', StringType()),
+    StructField('OwnerPolicyNumber', StringType()),
+    StructField('OwnerPolicyAmount', StringType()),
+    StructField('OwnerPolicyDate', StringType()),
+    StructField('LoanPolicyNumber', StringType()),
+    StructField('LoanPolicyAmount', StringType()),
+    StructField('LoanPolicyDate', StringType()),
+    StructField('LoanNumber', StringType()),
+    StructField('LoanRecordingDate', StringType()),
+    StructField('LoanBook', StringType()),
+    StructField('LoanPage', StringType()),
+    StructField('LoanInstNumber', StringType()),
+    StructField('DeedRecordingDate', StringType()),
+    StructField('DeedBook', StringType()),
+    StructField('DeedPage', StringType()),
+    StructField('DeedInstNumber', StringType()),
+    StructField('InsuredOrganizationName', StringType()),
+    StructField('InsuredVestingBlob', StringType()),
+    StructField('InsuredName0First', StringType()),
+    StructField('InsuredName0Middle', StringType()),
+    StructField('InsuredName0Last', StringType()),
+    StructField('InsuredName0Suffix', StringType()),
+    StructField('InsuredName1First', StringType()),
+    StructField('InsuredName1Middle', StringType()),
+    StructField('InsuredName1Last', StringType()),
+    StructField('InsuredName1Suffix', StringType()),
+    StructField('InsuredName2First', StringType()),
+    StructField('InsuredName2Middle', StringType()),
+    StructField('InsuredName2Last', StringType()),
+    StructField('InsuredName3First', StringType()),
+    StructField('InsuredName3Last', StringType()),
+    StructField('BuyerOrganizationName', StringType()),
+    StructField('BuyerVesting', StringType()),
+    StructField('BuyerName0First', StringType()),
+    StructField('BuyerName0Middle', StringType()),
+    StructField('BuyerName0Last', StringType()),
+    StructField('BuyerName0Suffix', StringType()),
+    StructField('BuyerName1First', StringType()),
+    StructField('BuyerName1Middle', StringType()),
+    StructField('BuyerName1Last', StringType()),
+    StructField('BuyerName1Suffix', StringType()),
+    StructField('BuyerName2First', StringType()),
+    StructField('BuyerName2Middle', StringType()),
+    StructField('BuyerName2Last', StringType()),
+    StructField('OwnerSellerOrganizationName', StringType()),
+    StructField('OwnerSellerName0First', StringType()),
+    StructField('OwnerSellerName0Middle', StringType()),
+    StructField('OwnerSellerName0Last', StringType()),
+    StructField('OwnerSellerName0Suffix', StringType()),
+    StructField('OwnerSellerName1First', StringType()),
+    StructField('OwnerSellerName1Middle', StringType()),
+    StructField('OwnerSellerName1Last', StringType()),
+    StructField('OwnerSellerName1Suffix', StringType()),
+    StructField('OwnerSellerName2First', StringType()),
+    StructField('OwnerSellerName2Middle', StringType()),
+    StructField('OwnerSellerName2Last', StringType()),
+    StructField('OwnerSellerName2Suffix', StringType()),
+    StructField('SitusAddress', StringType()),
+    StructField('SitusCity', StringType()),
+    StructField('SitusState', StringType()),
+    StructField('SitusZip', StringType()),
+    StructField('FullLegal', StringType()),
+    StructField('LegalCity', StringType()),
+    StructField('LegalCounty', StringType()),
+    StructField('LegalState', StringType()),
+    StructField('Easementblob', StringType()),
+    StructField('CCRBlob', StringType()),
+    StructField('SubdivisionName0', StringType()),
+    StructField('SubdivisionName1', StringType()),
+    StructField('SubdivisionName2', StringType()),
+    StructField('SubdivisionName3', StringType()),
+    StructField('SubdivisionName4', StringType()),
+    StructField('Lot0', StringType()),
+    StructField('Lot1', StringType()),
+    StructField('Lot2', StringType()),
+    StructField('Lot3', StringType()),
+    StructField('Lot4', StringType()),
+    StructField('Block0', StringType()),
+    StructField('Block1', StringType()),
+    StructField('Block2', StringType()),
+    StructField('Block3', StringType()),
+    StructField('Block4', StringType()),
+    StructField('Unit0', StringType()),
+    StructField('Unit1', StringType()),
+    StructField('Unit2', StringType()),
+    StructField('Building0', StringType()),
+    StructField('APN0', StringType()),
+    StructField('APN1', StringType()),
+    StructField('APN2', StringType()),
+    StructField('APN3', StringType()),
+    StructField('APN4', StringType()),
+    StructField('APN5', StringType()),
+    StructField('APN6', StringType()),
+    StructField('MapBook0', StringType()),
+    StructField('MapBook1', StringType()),
+    StructField('MapBook2', StringType()),
+    StructField('MapBook3', StringType()),
+    StructField('MapBook4', StringType()),
+    StructField('MapPage0', StringType()),
+    StructField('MapPage1', StringType()),
+    StructField('MapPage2', StringType()),
+    StructField('MapPage3', StringType()),
+    StructField('MapPage4', StringType()),
+    StructField('Map_Document_Number_0', StringType()),
+    StructField('Map_Document_Number_1', StringType()),
+    StructField('Map_Document_Number_2', StringType()),
+    StructField('Map_Document_Number_3', StringType()),
+    StructField('Map_Document_Number_4', StringType()),
+    StructField('Section0', StringType()),
+    StructField('Section1', StringType()),
+    StructField('Section2', StringType()),
+    StructField('Range0', StringType()),
+    StructField('Range1', StringType()),
+    StructField('Range2', StringType()),
+    StructField('Township0', StringType()),
+    StructField('Township1', StringType()),
+    StructField('Township2', StringType()),
+    StructField('Quarter0', StringType()),
+    StructField('Quarter1', StringType()),
+    StructField('Quarter2', StringType()),
+])
+
+outputs_pdf = (
+    spark.table(OUTPUT_TABLE)
+    .withColumn("parsed", from_json(col("model_output"), extraction_schema))
+    .select("File_Name", "parsed.*")
+    .toPandas()
+)
+outputs_melted = pd.melt(outputs_pdf, id_vars=["File_Name"], var_name="field", value_name="prediction")
+
+gt_pdf = (
+    spark.table(EVAL_TABLE)
+    .withColumn("gt", from_json(col("ground_truths"), extraction_schema))
+    .selectExpr("file_name AS File_Name", "gt.*")
+    .toPandas()
+)
+gt_melted = pd.melt(gt_pdf, id_vars=["File_Name"], var_name="field", value_name="ground_truth")
+
+
+def is_json_object(s):
+    try:
+        return isinstance(json.loads(s), dict)
+    except (TypeError, ValueError):
+        return False
+
+
+JSON_PARSE_FAILURES = sum(not is_json_object(r["model_output"]) for r in results)
+INFERENCE_ERRORS = len(errors)
+print(f"Predictions: {len(outputs_melted)} field values | Ground truth: {len(gt_melted)} field values")
+print(f"json_parse_failures={JSON_PARSE_FAILURES}  inference_errors={INFERENCE_ERRORS}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Compute field-level metrics
+# LEFT join on GROUND TRUTH: a doc that errored/timed out has no prediction rows -> NaN ->
+# 'NA' -> FN. (FFT notebook 05 and the CLI do the same; an inner join would inflate F1.)
+merged = pd.merge(gt_melted, outputs_melted, on=["File_Name", "field"], how="left").fillna("NA")
+
+N_DOCS = spark.table(EVAL_TABLE).count()
+assert merged["File_Name"].nunique() == N_DOCS, (
+    f"Scored {merged['File_Name'].nunique()} docs but {EVAL_TABLE} has {N_DOCS} — every doc must be scored."
+)
+
+
+def is_match(gt, pred, threshold=0.6):
+    if gt == 'NA' and pred == 'NA':
+        return 'TN'  # True Negative
+    if gt == 'NA' and pred != 'NA':
+        return 'FP'  # False Positive
+    if gt != 'NA' and pred == 'NA':
+        return 'FN'  # False Negative
+    if difflib.SequenceMatcher(None, str(gt).lower(), str(pred).lower()).ratio() > threshold:
+        return 'TP'  # True Positive
+    return 'FP'  # Mismatch
+
+
+def compute_prf(df):
+    tp = (df["result"] == "TP").sum()
+    fp = (df["result"] == "FP").sum()
+    fn = (df["result"] == "FN").sum()
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    return {"precision": float(precision), "recall": float(recall), "f1": float(f1)}
+
+
+merged["result"] = merged.apply(lambda r: is_match(r["ground_truth"], r["prediction"]), axis=1)
+overall = compute_prf(merged)
+top8 = compute_prf(merged[merged["field"].isin(TOP_8_FIELDS)])
+
+print(f"=== {EVAL_SPLIT.upper()} metrics — {RUN_TAG} ({N_DOCS} docs) ===")
+print(f"  all:  P {overall['precision']:.4f}  R {overall['recall']:.4f}  F1 {overall['f1']:.4f}")
+print(f"  top8: P {top8['precision']:.4f}  R {top8['recall']:.4f}  F1 {top8['f1']:.4f}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Per-field accuracy breakdown
+field_metrics = merged.groupby("field")["result"].apply(
+    lambda x: pd.Series({
+        "accuracy": ((x == "TP") | (x == "TN")).sum() / len(x),
+        "tp": (x == "TP").sum(),
+        "fp": (x == "FP").sum(),
+        "fn": (x == "FN").sum(),
+        "tn": (x == "TN").sum(),
+    })
+).unstack().sort_values("accuracy", ascending=False)
+display(spark.createDataFrame(field_metrics.reset_index()))
+
+# COMMAND ----------
+
+# DBTITLE 1,Log metrics to MLflow
+import mlflow
+
+mlflow.set_experiment(EXPERIMENT_PATH)
+with mlflow.start_run(run_name=f"{STAGE}_{RUN_TAG}") as run:
+    mlflow.log_metrics({f"all_{k}": v for k, v in overall.items()})
+    mlflow.log_metrics({f"top8_{k}": v for k, v in top8.items()})
+    mlflow.log_metrics({"json_parse_failures": JSON_PARSE_FAILURES, "inference_errors": INFERENCE_ERRORS})
+    mlflow.log_params({
+        "eval_split": EVAL_SPLIT,
+        "eval_table": EVAL_TABLE,
+        "run_tag": RUN_TAG,
+        "train_mode": TRAIN_MODE,
+        "merged_dir": MERGED_DIR,
+        "merge_base_model": MERGE_BASE_MODEL,
+        "inference": "local_vllm",
+        "matching_threshold": 0.6,
+        "max_model_len": MAX_MODEL_LEN,
+        "max_new_tokens": MAX_NEW_TOKENS,
+        "documents_scored": N_DOCS,
+    })
+    mlflow.set_tags({"stage": STAGE, "approach": "peft-lora"})
+    print(f"Logged to MLflow run {run.info.run_id} (split={EVAL_SPLIT}, stage={STAGE})")
