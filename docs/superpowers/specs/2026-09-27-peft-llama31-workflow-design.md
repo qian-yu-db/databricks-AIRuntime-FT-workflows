@@ -4,6 +4,8 @@
 **Location:** `LLM_PEFT_finetuning_workflow/notebooks/`
 **Status:** Design — awaiting review
 
+> **Amendment (2026-09-27, after implementation review):** the 4-bit QLoRA / A10 mode was **removed** at the user's request. Estimated wall-clock on A10 was ~2.5× longer than H100, and the A10's 4096-token limit would drop about half the training documents. The workflow is now **bf16 LoRA on 1×H100 only**: no `train_mode` flag; notebook 01 widgets default to `gpu_type=H100`, `max_seq_length=16384`, batch 1 × accum 8, `base_model=unsloth/Meta-Llama-3.1-8B-Instruct`; `RUN_TAG = lora_r{r}_lr{lr}_ep{epochs}`; notebooks 02/03 run on 1×H100 (`max_num_seqs=14`); serving is fixed at `GPU_LARGE`. Sections below that mention `qlora_4bit`, A10, `GPU_MEDIUM` or 4-bit merge-base handling describe the original design and are superseded.
+
 ## 1. Goal
 
 Build a PEFT counterpart to `LLM_FFT_finetuning_workflow/`: fine-tune **Llama 3.1 8B Instruct** with **Unsloth LoRA**, **merge** the adapter into bf16 base weights, and **serve** the merged model on Databricks Model Serving (vLLM custom entrypoint) — on the **same title-insurance entity-extraction dataset** (OCR text → sparse JSON) and with the **same evaluation metrics**, so PEFT and FFT results are directly comparable.

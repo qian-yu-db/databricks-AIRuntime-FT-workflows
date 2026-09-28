@@ -13,7 +13,7 @@
 # MAGIC `env_pack`, deployed as an `llm/v1/chat` endpoint. Then `ai_query()` over the **held-out
 # MAGIC test** set — scored **once**, on the `run_tag` you selected on validation — logged `stage=test`.
 # MAGIC
-# MAGIC **Compute:** Serverless GPU (A10 or H100), AI v5. Must be GPU: `env_pack` needs the RAM, and
+# MAGIC **Compute:** Serverless GPU **1×H100**, AI v5. Must be GPU: `env_pack` needs the RAM, and
 # MAGIC logging from CPU packages CPU deps so the GPU endpoint fails to start (spec G6c, G13).
 
 # COMMAND ----------
@@ -41,16 +41,15 @@ assert transformers.__version__ == "4.57.6", (
 
 # COMMAND ----------
 
-dbutils.widgets.text("run_tag", "qlora_4bit_r16_lr2e-4_ep3", "Run tag (best on validation)")
+dbutils.widgets.text("run_tag", "lora_r16_lr2e-4_ep3", "Run tag (best on validation)")
 dbutils.widgets.text("catalog", "fins_genai", "Catalog")
 dbutils.widgets.text("schema", "fine_tuning", "Schema")
 dbutils.widgets.text("volume", "training_data", "Volume")
 dbutils.widgets.text("volume_model", "checkpoints", "Volume for Model")
 dbutils.widgets.text("experiment_path", "/Users/q.yu@databricks.com/mlflow_experiments/agency-peft-llama31", "MLflow Experiment Path")
 dbutils.widgets.text("endpoint_name", "agency-llama-peft-vllm", "Serving endpoint name")
-dbutils.widgets.dropdown("workload_type", "GPU_LARGE", ["GPU_MEDIUM", "GPU_LARGE"], "Serving GPU (GPU_MEDIUM = A10)")
 dbutils.widgets.text("max_model_len", "20480", "vLLM max model len")
-dbutils.widgets.text("max_num_seqs", "14", "vLLM max concurrent seqs at serving (lower for GPU_MEDIUM)")
+dbutils.widgets.text("max_num_seqs", "14", "vLLM max concurrent seqs at serving")
 # Blank = register a NEW version. Set to an existing version to redeploy without re-registering
 # (env_pack takes 20-30 min).
 dbutils.widgets.text("model_version", "", "Existing UC model version (blank = register new)")
@@ -71,7 +70,7 @@ VOLUME_MODEL = dbutils.widgets.get("volume_model")
 EXPERIMENT_PATH = dbutils.widgets.get("experiment_path")
 
 RUN_TAG = dbutils.widgets.get("run_tag").strip()
-assert re.fullmatch(r"(qlora_4bit|lora_bf16)_r\d+_lr.+_ep\d+", RUN_TAG), (
+assert re.fullmatch(r"lora_r\d+_lr.+_ep\d+", RUN_TAG), (
     f"run_tag {RUN_TAG!r} does not look like notebook 01's RUN_TAG."
 )
 TABLE_SUFFIX = re.sub(r"[^0-9A-Za-z_]", "_", RUN_TAG)
@@ -88,9 +87,8 @@ MAX_NUM_SEQS = int(dbutils.widgets.get("max_num_seqs"))
 
 UC_MODEL_NAME = f"{CATALOG}.{SCHEMA}.llama31_8b_agency_peft"
 ENDPOINT_NAME = dbutils.widgets.get("endpoint_name").strip()
-_wt = dbutils.widgets.get("workload_type").strip()
-assert _wt in ServingModelWorkloadType.__members__, f"Unknown workload_type {_wt!r}"
-WORKLOAD_TYPE = ServingModelWorkloadType[_wt]
+# Same serving GPU as FFT notebook 05: bf16 8B weights (~16 GB) + KV cache at 20K context.
+WORKLOAD_TYPE = ServingModelWorkloadType.GPU_LARGE
 WORKLOAD_SIZE = "Small"         # Beta: fixed replicas, no autoscaling (spec G14)
 SCALE_TO_ZERO_ENABLED = False   # GPU endpoints without scale-to-zero may be deleted daily (G6c)
 MODEL_VERSION_OVERRIDE = dbutils.widgets.get("model_version").strip()
@@ -108,7 +106,7 @@ TOP_8_FIELDS = [
     "OwnerPolicyNumber", "OwnerPolicyAmount", "OwnerPolicyDate",
     "LoanPolicyNumber", "LoanPolicyAmount", "LoanPolicyDate",
 ]
-print(f"run_tag={RUN_TAG}\nweights: {MERGED_DIR}\nUC model: {UC_MODEL_NAME}\nendpoint: {ENDPOINT_NAME} ({_wt})")
+print(f"run_tag={RUN_TAG}\nweights: {MERGED_DIR}\nUC model: {UC_MODEL_NAME}\nendpoint: {ENDPOINT_NAME} ({WORKLOAD_TYPE.value})")
 
 # COMMAND ----------
 

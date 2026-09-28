@@ -10,12 +10,11 @@
 # MAGIC
 # MAGIC 1. **Merge** — load the **bf16** Llama 3.1 8B Instruct base, apply the adapter from notebook 01
 # MAGIC    (`PeftModel`), `merge_and_unload()`, save the merged HF checkpoint to the Volume.
-# MAGIC    Always merges into bf16 — also for `qlora_4bit` adapters — so serving is identical.
 # MAGIC 2. **Validation eval** — launch a local vLLM server on the merged weights, run the
 # MAGIC    **val** split, score field-level P/R/F1 exactly like the FFT workflow, log `stage=eval`.
 # MAGIC
-# MAGIC **Compute:** Serverless GPU, AI v5, **A10 or H100** (H100 is faster; on A10 keep
-# MAGIC `max_num_seqs=2`). No Unsloth here — vLLM's pinned stack only (spec G1, G12).
+# MAGIC **Compute:** Serverless GPU **1×H100**, AI v5. No Unsloth here — vLLM's pinned stack only
+# MAGIC (spec G1, G12).
 
 # COMMAND ----------
 
@@ -46,7 +45,7 @@ assert transformers.__version__ == "4.57.6", (
 
 # COMMAND ----------
 
-dbutils.widgets.text("run_tag", "qlora_4bit_r16_lr2e-4_ep3", "Run tag (printed by notebook 01)")
+dbutils.widgets.text("run_tag", "lora_r16_lr2e-4_ep3", "Run tag (printed by notebook 01)")
 dbutils.widgets.text("catalog", "fins_genai", "Catalog")
 dbutils.widgets.text("schema", "fine_tuning", "Schema")
 dbutils.widgets.text("volume", "training_data", "Volume")
@@ -55,7 +54,7 @@ dbutils.widgets.text("experiment_path", "/Users/q.yu@databricks.com/mlflow_exper
 dbutils.widgets.text("merge_base_model", "unsloth/Meta-Llama-3.1-8B-Instruct", "Merge base (bf16; HF id or /Volumes path)")
 dbutils.widgets.text("max_model_len", "20480", "vLLM max model len")
 dbutils.widgets.text("max_new_tokens", "3500", "Max new tokens")
-dbutils.widgets.text("max_num_seqs", "2", "vLLM max concurrent seqs (2 on A10, up to 14 on H100)")
+dbutils.widgets.text("max_num_seqs", "14", "vLLM max concurrent seqs")
 dbutils.widgets.text("gpu_memory_utilization", "0.90", "vLLM GPU memory utilization")
 dbutils.widgets.text("request_timeout", "600", "Per-request timeout (s)")
 # val = SELECTION eval (stage=eval). test only for a deliberate one-off (stage=test).
@@ -75,9 +74,9 @@ VOLUME_MODEL = dbutils.widgets.get("volume_model")
 EXPERIMENT_PATH = dbutils.widgets.get("experiment_path")
 
 RUN_TAG = dbutils.widgets.get("run_tag").strip()
-_m = re.fullmatch(r"(qlora_4bit|lora_bf16)_r\d+_lr.+_ep\d+", RUN_TAG)
-assert _m, f"run_tag {RUN_TAG!r} does not look like notebook 01's RUN_TAG (e.g. qlora_4bit_r16_lr2e-4_ep3)."
-TRAIN_MODE = _m.group(1)
+assert re.fullmatch(r"lora_r\d+_lr.+_ep\d+", RUN_TAG), (
+    f"run_tag {RUN_TAG!r} does not look like notebook 01's RUN_TAG (e.g. lora_r16_lr2e-4_ep3)."
+)
 TABLE_SUFFIX = re.sub(r"[^0-9A-Za-z_]", "_", RUN_TAG)
 
 ADAPTER_DIR = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME_MODEL}/agency-peft-adapter-{RUN_TAG}"
@@ -118,7 +117,7 @@ TOP_8_FIELDS = [
     "LoanPolicyNumber", "LoanPolicyAmount", "LoanPolicyDate",
 ]
 
-print(f"run_tag={RUN_TAG} (train_mode={TRAIN_MODE})")
+print(f"run_tag={RUN_TAG}")
 print(f"adapter:  {ADAPTER_DIR}\nmerged -> {MERGED_DIR}")
 print(f"eval split: {EVAL_SPLIT} -> {EVAL_TABLE} (MLflow stage={STAGE})")
 
@@ -135,17 +134,12 @@ with open(os.path.join(ADAPTER_DIR, "adapter_config.json")) as f:
 
 
 def model_family(name):
-    """Normalize a mirror id so a 4-bit repo and its bf16 source compare equal."""
-    n = name.lower().rstrip("/")
-    for suffix in ("-unsloth-bnb-4bit", "-bnb-4bit"):
-        if n.endswith(suffix):
-            return n[: -len(suffix)]
-    return n
+    """Normalize a model id for comparison (case and trailing slash)."""
+    return name.lower().rstrip("/")
 
 
 print(f"Adapter trained on: {ADAPTER_BASE}")
 print(f"Merging into:       {MERGE_BASE_MODEL}")
-assert "bnb-4bit" not in MERGE_BASE_MODEL.lower(), "merge_base_model must be the bf16 base, not a 4-bit repo."
 if MERGE_BASE_MODEL.startswith("/") or ADAPTER_BASE.startswith("/"):
     print("WARNING: a base is a local/Volume path — cannot verify it matches the training base. "
           "Confirm it is the same Llama 3.1 8B Instruct weights (spec G10).")
@@ -218,10 +212,10 @@ else:
               "prompts may not match. Inspect both before trusting the eval.")
     _pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     base = AutoModelForCausalLM.from_pretrained(MERGE_BASE_MODEL, torch_dtype=torch.bfloat16, device_map="cuda")
-    peft_model = PeftModel.from_pretrained(base, ADAPTER_DIR)  # uses `base`, ignores adapter's 4-bit base id
+    peft_model = PeftModel.from_pretrained(base, ADAPTER_DIR)  # applies the adapter onto `base`
     peft_model.eval()
 
-    # Sanity check on the SHORTEST val document (keeps HF generate fast on an A10).
+    # Sanity check on the SHORTEST val document (keeps HF generate fast).
     _sample_ocr = (
         spark.table(f"{CATALOG}.{SCHEMA}.agency_ft_dataset_val_v3")
         .orderBy(F.length("raw_ocr_content"))
@@ -249,8 +243,8 @@ else:
         "Adapter output is not JSON — check the adapter / training run before merging."
     )
     if unmerged_out != merged_out:
-        # bf16 rounding can flip a greedy token; for qlora_4bit the bf16 base also differs from
-        # the 4-bit training base. The merged-model val F1 below is the authoritative check.
+        # bf16 rounding in the merge can flip a greedy token even when the merge is correct.
+        # The merged-model val F1 below is the authoritative check.
         print("WARNING: merged and unmerged greedy outputs differ (expected small drift, see comment).")
 
     merged.save_pretrained(LOCAL_MERGED, safe_serialization=True, max_shard_size="5GB")
@@ -350,7 +344,7 @@ if not ready:
     with open(log_path) as f:
         print("".join(f.readlines()[-120:]))
     raise RuntimeError(
-        f"vLLM did not become ready within {STARTUP_TIMEOUT}s. On an A10, a KV-cache error means: "
+        f"vLLM did not become ready within {STARTUP_TIMEOUT}s. A KV-cache/memory error means: "
         "lower max_model_len (e.g. 16384) or raise gpu_memory_utilization slightly."
     )
 
@@ -688,7 +682,6 @@ with mlflow.start_run(run_name=f"{STAGE}_{RUN_TAG}") as run:
         "eval_split": EVAL_SPLIT,
         "eval_table": EVAL_TABLE,
         "run_tag": RUN_TAG,
-        "train_mode": TRAIN_MODE,
         "merged_dir": MERGED_DIR,
         "merge_base_model": MERGE_BASE_MODEL,
         "inference": "local_vllm",

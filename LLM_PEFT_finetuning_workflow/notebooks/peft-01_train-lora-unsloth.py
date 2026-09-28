@@ -6,7 +6,7 @@
 # ///
 # DBTITLE 1,Introduction
 # MAGIC %md
-# MAGIC # PEFT Fine-Tuning — Llama 3.1 8B Instruct + Unsloth (LoRA / QLoRA)
+# MAGIC # PEFT Fine-Tuning — Llama 3.1 8B Instruct + Unsloth (bf16 LoRA on H100)
 # MAGIC
 # MAGIC Parameter-efficient fine-tuning of **Llama 3.1 8B Instruct** for title-insurance entity
 # MAGIC extraction (OCR text → sparse JSON), on the **same train/val tables** as the FFT workflow
@@ -16,10 +16,9 @@
 # MAGIC - **`@distributed(gpus=1, gpu_type=...)`** from `serverless_gpu` launches training on one GPU
 # MAGIC - **MLflow** tracks the run; only the **LoRA adapter** is saved (merge happens in notebook 02)
 # MAGIC
-# MAGIC | `train_mode` | Base | GPU | `max_seq_length` | When |
+# MAGIC | Base | Precision | GPU | `max_seq_length` | batch × accum |
 # MAGIC | --- | --- | --- | --- | --- |
-# MAGIC | `qlora_4bit` (default) | `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` | A10 | 4096 | cheap, fast iteration |
-# MAGIC | `lora_bf16` | `unsloth/Meta-Llama-3.1-8B-Instruct` | H100 | 16384 | more precision, full-length docs |
+# MAGIC | `unsloth/Meta-Llama-3.1-8B-Instruct` | bf16 LoRA | 1×H100 | 16384 (covers ~all documents) | 1 × 8 |
 # MAGIC
 # MAGIC **Compute:** Serverless GPU with the **AI v6** environment. Do **not** install vLLM in this
 # MAGIC notebook — Unsloth and vLLM pin conflicting torch/transformers (spec G1).
@@ -32,19 +31,17 @@
 
 # COMMAND ----------
 
-dbutils.widgets.dropdown("train_mode", "qlora_4bit", ["qlora_4bit", "lora_bf16"], "Train mode")
 dbutils.widgets.text("catalog", "fins_genai", "Catalog")
 dbutils.widgets.text("schema", "fine_tuning", "Schema")
 dbutils.widgets.text("volume", "training_data", "Volume")
 dbutils.widgets.text("volume_model", "checkpoints", "Volume for Model")
 dbutils.widgets.text("experiment_path", "/Users/q.yu@databricks.com/mlflow_experiments/agency-peft-llama31", "MLflow Experiment Path")
-# Mode-dependent settings — leave BLANK to inherit the train_mode default.
-dbutils.widgets.text("base_model", "", "Base model (blank = mode default; HF id or /Volumes path)")
-dbutils.widgets.text("gpu_type", "", "GPU type (blank = mode default)")
-dbutils.widgets.text("max_seq_length", "", "Max sequence length (blank = mode default)")
-dbutils.widgets.text("per_device_batch_size", "", "Per-device batch size (blank = mode default)")
-dbutils.widgets.text("gradient_accumulation_steps", "", "Gradient accumulation (blank = mode default)")
-# Shared LoRA / optimizer settings.
+dbutils.widgets.text("base_model", "unsloth/Meta-Llama-3.1-8B-Instruct", "Base model (bf16; HF id or /Volumes path)")
+dbutils.widgets.text("gpu_type", "H100", "GPU type")
+dbutils.widgets.text("max_seq_length", "16384", "Max sequence length")
+dbutils.widgets.text("per_device_batch_size", "1", "Per-device batch size")
+dbutils.widgets.text("gradient_accumulation_steps", "8", "Gradient accumulation steps")
+# LoRA / optimizer settings.
 dbutils.widgets.text("lora_r", "16", "LoRA rank r")
 dbutils.widgets.text("lora_alpha", "16", "LoRA alpha")
 dbutils.widgets.text("learning_rate", "2e-4", "Learning rate")
@@ -55,48 +52,17 @@ dbutils.widgets.text("num_epochs", "3", "Number of epochs")
 # DBTITLE 1,Configuration
 import re
 
-# train_mode sets the defaults; any non-blank widget above overrides them.
-MODE_DEFAULTS = {
-    "qlora_4bit": {
-        "base_model": "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
-        "load_in_4bit": True,
-        "gpu_type": "A10",
-        "max_seq_length": "4096",
-        "per_device_batch_size": "2",
-        "gradient_accumulation_steps": "4",
-    },
-    "lora_bf16": {
-        "base_model": "unsloth/Meta-Llama-3.1-8B-Instruct",
-        "load_in_4bit": False,
-        "gpu_type": "H100",
-        "max_seq_length": "16384",
-        "per_device_batch_size": "1",
-        "gradient_accumulation_steps": "8",
-    },
-}
-
-TRAIN_MODE = dbutils.widgets.get("train_mode").strip()
-assert TRAIN_MODE in MODE_DEFAULTS, f"train_mode must be one of {sorted(MODE_DEFAULTS)}, got {TRAIN_MODE!r}"
-
-
-def mode_setting(name):
-    """Widget value if set, else the train_mode default (blank widget = inherit)."""
-    value = dbutils.widgets.get(name).strip()
-    return value if value else MODE_DEFAULTS[TRAIN_MODE][name]
-
-
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
 VOLUME = dbutils.widgets.get("volume")
 VOLUME_MODEL = dbutils.widgets.get("volume_model")
 EXPERIMENT_PATH = dbutils.widgets.get("experiment_path")
 
-BASE_MODEL = mode_setting("base_model")
-LOAD_IN_4BIT = MODE_DEFAULTS[TRAIN_MODE]["load_in_4bit"]
-GPU_TYPE = mode_setting("gpu_type")
-MAX_SEQ_LENGTH = int(mode_setting("max_seq_length"))
-PER_DEVICE_BATCH_SIZE = int(mode_setting("per_device_batch_size"))
-GRADIENT_ACCUMULATION_STEPS = int(mode_setting("gradient_accumulation_steps"))
+BASE_MODEL = dbutils.widgets.get("base_model").strip()
+GPU_TYPE = dbutils.widgets.get("gpu_type").strip()
+MAX_SEQ_LENGTH = int(dbutils.widgets.get("max_seq_length"))
+PER_DEVICE_BATCH_SIZE = int(dbutils.widgets.get("per_device_batch_size"))
+GRADIENT_ACCUMULATION_STEPS = int(dbutils.widgets.get("gradient_accumulation_steps"))
 
 LORA_R = int(dbutils.widgets.get("lora_r"))
 LORA_ALPHA = int(dbutils.widgets.get("lora_alpha"))
@@ -108,7 +74,7 @@ LEARNING_RATE = float(_lr_str)
 NUM_EPOCHS = int(_ep_str)
 
 # Unique per config; notebooks 02/03 take this as their run_tag widget.
-RUN_TAG = f"{TRAIN_MODE}_r{LORA_R}_lr{_lr_str}_ep{_ep_str}"  # e.g. qlora_4bit_r16_lr2e-4_ep3
+RUN_TAG = f"lora_r{LORA_R}_lr{_lr_str}_ep{_ep_str}"  # e.g. lora_r16_lr2e-4_ep3
 assert re.fullmatch(r"[A-Za-z0-9_.\-]+", RUN_TAG), f"RUN_TAG has unsafe characters: {RUN_TAG!r}"
 
 TRAIN_TABLE = f"{CATALOG}.{SCHEMA}.agency_ft_dataset_train_v3"
@@ -123,8 +89,7 @@ ADAPTER_DIR = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME_MODEL}/agency-peft-adapter-{
 INSTRUCTION_PART = "<|start_header_id|>user<|end_header_id|>\n\n"
 RESPONSE_PART = "<|start_header_id|>assistant<|end_header_id|>\n\n"
 
-print(f"train_mode:     {TRAIN_MODE}")
-print(f"base_model:     {BASE_MODEL}  (load_in_4bit={LOAD_IN_4BIT})")
+print(f"base_model:     {BASE_MODEL}  (bf16)")
 print(f"gpu_type:       {GPU_TYPE}")
 print(f"max_seq_length: {MAX_SEQ_LENGTH}")
 print(f"batch x accum:  {PER_DEVICE_BATCH_SIZE} x {GRADIENT_ACCUMULATION_STEPS}")
@@ -231,7 +196,7 @@ from serverless_gpu import distributed
 
 @distributed(gpus=1, gpu_type=GPU_TYPE)
 def run_training():
-    """Unsloth LoRA/QLoRA SFT with response-only loss; saves only the adapter."""
+    """Unsloth bf16 LoRA SFT with response-only loss; saves only the adapter."""
     import os
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
@@ -250,8 +215,8 @@ def run_training():
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=BASE_MODEL,
         max_seq_length=MAX_SEQ_LENGTH,
-        dtype=None,  # auto: bf16 on A10/H100
-        load_in_4bit=LOAD_IN_4BIT,
+        dtype=None,  # auto: bf16 on H100
+        load_in_4bit=False,  # bf16 weights (not quantized)
     )
     # pad == eos would mask <|eot_id|> out of the labels -> the model never learns to stop.
     assert tokenizer.pad_token is not None and tokenizer.pad_token_id != tokenizer.eos_token_id, (
@@ -333,10 +298,8 @@ def run_training():
         # MLflow callback logs those, and MLflow rejects re-logging a key with a new value.
         mlflow.log_params({
             "run_tag": RUN_TAG,
-            "train_mode": TRAIN_MODE,
             "training_method": "lora_unsloth",
             "base_model": BASE_MODEL,
-            "load_in_4bit": LOAD_IN_4BIT,
             "gpu_type": GPU_TYPE,
             "lora_r": LORA_R,
             "lora_alpha": LORA_ALPHA,
@@ -397,5 +360,5 @@ print(f"\n>>> run_tag for notebooks 02/03: {RUN_TAG}")
 # MAGIC 1. Copy the printed `run_tag` into **peft-02_merge-and-val-eval** → merges the adapter into
 # MAGIC    the bf16 Instruct base and scores the **validation** split (MLflow `stage=eval`).
 # MAGIC 2. Compare val runs in MLflow; take the best `run_tag` to **peft-03_register-deploy-test**.
-# MAGIC 3. If val F1 falls short: try `lr` 1e-4 / 5e-4, or a larger `lora_r` (keep `alpha/r` fixed),
-# MAGIC    or switch to `train_mode=lora_bf16` on H100 for full-length context.
+# MAGIC 3. If val F1 falls short: try `lr` 1e-4 / 5e-4, or a larger `lora_r` (keep `alpha/r` fixed).
+# MAGIC    If val F1 is high but train loss → ~0 and eval loss rises, try `num_epochs=2`.
