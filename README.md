@@ -15,9 +15,11 @@ Worked examples for **full-parameter fine-tuning of an open LLM on Databricks AI
 ```
 .
 ├── CLI_starter_example/         # minimal starter: fine-tune a small model from the `air` CLI on YAML files
-├── LLM_finetuning_workflow/     # full-parameter fine-tuning — two interchangeable stacks
+├── LLM_FFT_finetuning_workflow/  # full-parameter fine-tuning — two interchangeable stacks
 │   ├── notebooks/               #   notebook-driven pipeline (TRL SFTTrainer + DeepSpeed ZeRO-3)
 │   └── cli/                     #   CLI-driven, laptop end-to-end workflow via the `air` CLI (Axolotl full-FT + FSDP)
+├── LLM_PEFT_finetuning_workflow/ # parameter-efficient fine-tuning (bf16 LoRA, Unsloth, Llama 3.1 8B)
+│   └── notebooks/               #   train → merge → val eval → Provisioned Throughput (or vLLM) serving
 └── LLM_serving_workflow/        # load-test & size a Model Serving endpoint for the fine-tuned model
 ```
 
@@ -30,7 +32,7 @@ sections below orient you to which one to use.
 
 Fine-tune Qwen3-8B with **full-parameter SFT** (no LoRA) on information extraction task and evaluate with holdout dataset (see [Evaluation methodology](#evaluation-methodology)):
 
-- **[`LLM_finetuning_workflow/notebooks/`](LLM_finetuning_workflow/notebooks/README.md)** - an end-to-end notebook based workflow running in Databricks workspaces: 
+- **[`LLM_FFT_finetuning_workflow/notebooks/`](LLM_FFT_finetuning_workflow/notebooks/README.md)** - an end-to-end notebook based workflow running in Databricks workspaces: 
   * Notebook 00 — Data Setup
   * Notebook 01 — Training (**TRL `SFTTrainer` + DeepSpeed ZeRO-3**, launched via AI Runtime on 8×H100)
   * Notebook 02 — vLLM eval, launched via AI Runtime on 1×H100
@@ -39,12 +41,21 @@ Fine-tune Qwen3-8B with **full-parameter SFT** (no LoRA) on information extracti
   * Notebook 05 — Register & deploy the best model to a Model Serving endpoint
 
 
-- **[`LLM_finetuning_workflow/cli/`](LLM_finetuning_workflow/cli/README.md)** — a config-driven workflow that runs **end-to-end from your laptop** via the `air` CLI:
+- **[`LLM_FFT_finetuning_workflow/cli/`](LLM_FFT_finetuning_workflow/cli/README.md)** — a config-driven workflow that runs **end-to-end from your laptop** via the `air` CLI:
 
   * `scripts/prep_data.py` — local raw CSV → ChatML JSONL → upload to the UC Volume (pure Python, no Spark)
   * `scripts/run_sweep.py` expands `configs/grid.yaml` and submits one `air run` per cell; training uses **Axolotl full-FT with FSDP across 8×H100**
   * `--eval` scores checkpoints with **local vLLM on AI Runtime (1×H100)**; `--pick-best` ranks by held-out F1
   * `--register` registers the winning checkpoint to the **UC Model Registry** as a vLLM ChatModel
+
+Fine-tune Llama 3.1 8B Instruct with **PEFT (bf16 LoRA)** on the same task, dataset, splits, and metrics, so results are directly comparable with the full-parameter workflows:
+
+- **[`LLM_PEFT_finetuning_workflow/notebooks/`](LLM_PEFT_finetuning_workflow/notebooks/README.md)** - an end-to-end notebook based workflow running in Databricks workspaces:
+  * peft-00 — Data Setup (same shared tables as FFT notebook 00; skips if they already exist)
+  * peft-01 — Training (**Unsloth LoRA** with response-only loss, launched via AI Runtime on 1×H100)
+  * peft-02 — Merge the adapter into bf16 weights + local vLLM validation eval (1×H100)
+  * peft-03 PT — Register (`mlflow.transformers`) and deploy on **Provisioned Throughput** + held-out test eval (default)
+  * peft-03 vLLM — Register and deploy with vLLM Custom LLM Serving + held-out test eval (optional)
 
 ## Serving & load testing
 

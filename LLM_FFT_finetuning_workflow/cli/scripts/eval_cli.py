@@ -60,7 +60,7 @@ def _bootstrap_lib():
         here = os.getcwd()
     for base in (here, os.path.dirname(here), os.getcwd()):
         for cand in (os.path.join(base, "lib"),
-                     os.path.join(base, "LLM_finetuning_workflow", "cli", "lib")):
+                     os.path.join(base, "LLM_FFT_finetuning_workflow", "cli", "lib")):
             if os.path.isfile(os.path.join(cand, "extract_eval.py")):
                 if cand not in sys.path:
                     sys.path.insert(0, cand)

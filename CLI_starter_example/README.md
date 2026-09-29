@@ -87,7 +87,7 @@ Everything is in the two YAML files — edit and re-run:
 - **Different model** — change `base_model` in `sft.yaml` (any HF model id).
 - **Bigger model** — switch `accelerator_type` to `GPU_1xH100`, or raise
   `num_accelerators` and launch under `accelerate` for multi-GPU sharding (see the
-  8B FSDP example in [`../LLM_finetuning_workflow/cli/`](../LLM_finetuning_workflow/cli/)).
+  8B FSDP example in [`../LLM_FFT_finetuning_workflow/cli/`](../LLM_FFT_finetuning_workflow/cli/)).
 - **Your own data** — replace the `datasets:` entry. Point `path:` at another HF
   dataset, or at a JSONL file, and set the matching `type:` (`alpaca`, `chat_template`, …).
 - **Bigger/longer run** — bump `num_epochs`, `sequence_len`, or `micro_batch_size`.
@@ -98,6 +98,6 @@ Everything is in the two YAML files — edit and re-run:
   newer axolotl relaxes that pin.
 
 > This is the stripped-down version of the config-driven sweep in
-> [`../LLM_finetuning_workflow/cli/`](../LLM_finetuning_workflow/cli/README.md),
+> [`../LLM_FFT_finetuning_workflow/cli/`](../LLM_FFT_finetuning_workflow/cli/README.md),
 > which adds a grid sweep, held-out eval, ranking, and UC registration on top of the
 > same `air` + Axolotl foundation.
