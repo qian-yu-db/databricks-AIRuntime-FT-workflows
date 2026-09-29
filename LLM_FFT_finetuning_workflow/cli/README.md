@@ -52,7 +52,7 @@ A config-driven **learning-rate × epochs** sweep flow on **AI Runtime + the `ai
 ## Layout
 
 ```
-LLM_finetuning_workflow/cli/
+LLM_FFT_finetuning_workflow/cli/
 ├── configs/
 │   ├── grid.yaml            # ← THE knob: learning_rates[], epochs[], model, compute, experiment
 │   ├── axolotl_base.yaml    # Qwen3-8B full-FT recipe (template; per-run fields swept)
@@ -102,7 +102,7 @@ LLM_finetuning_workflow/cli/
 The happy path (each step gated by the previous):
 
 ```bash
-cd LLM_finetuning_workflow/cli
+cd LLM_FFT_finetuning_workflow/cli
 # use `uv run --with pyyaml python ...` if pyyaml isn't installed
 
 # 0. Prepare data (laptop, no GPU): raw CSV -> ChatML JSONL -> UC Volume

@@ -9,7 +9,7 @@ spec, submitted with `air run`.
 
 Run from your laptop (not on Databricks), from the repo root:
 
-    cd LLM_finetuning_workflow/cli
+    cd LLM_FFT_finetuning_workflow/cli
     python scripts/run_sweep.py --profile e2_demo_fieldeng                     # train full grid (8xH100)
     python scripts/run_sweep.py --profile e2_demo_fieldeng --serialize-start   # train, throttled (one cell into the GPU at a time)
     python scripts/run_sweep.py --profile e2_demo_fieldeng --dry-run           # generate + validate only
