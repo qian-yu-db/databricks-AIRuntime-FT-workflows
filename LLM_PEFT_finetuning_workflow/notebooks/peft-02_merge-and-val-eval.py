@@ -3,6 +3,14 @@
 # [tool.databricks.environment]
 # base_environment = "databricks_ai_v5"
 # environment_version = "5"
+# dependencies = [
+#   "vllm==0.11.2",
+#   "transformers==4.57.6",
+#   "openai==2.17.0",
+#   "mlflow==3.12.0",
+#   "hf_transfer==0.1.9",
+#   "\"databricks-sdk>=0.102.0\"",
+# ]
 # ///
 # DBTITLE 1,Introduction
 # MAGIC %md
@@ -27,8 +35,8 @@
 # peft: set to the `peft_version` param logged by notebook 01's MLflow run (spec G2).
 #   --no-deps so it cannot drag in transformers>=5 (spec G12).
 # opencv-python-headless 4.12: >=4.13 fails the FIPS self-test and aborts vLLM (spec G11).
-# MAGIC %pip install --no-deps peft==0.17.1 opencv-python-headless==4.12.0.88
-# MAGIC %restart_python
+%pip install --no-deps peft==0.17.1 opencv-python-headless==4.12.0.88
+%restart_python
 
 # COMMAND ----------
 

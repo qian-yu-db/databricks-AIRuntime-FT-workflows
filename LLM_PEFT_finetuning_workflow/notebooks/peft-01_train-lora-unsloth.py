@@ -218,6 +218,10 @@ def run_training():
         dtype=None,  # auto: bf16 on H100
         load_in_4bit=False,  # bf16 weights (not quantized)
     )
+    # apply_chat_template already embedded <|begin_of_text|>; stop the tokenizer from
+    # prepending a duplicate when SFTTrainer tokenizes the text field.
+    tokenizer.add_bos_token = False
+
     # pad == eos would mask <|eot_id|> out of the labels -> the model never learns to stop.
     assert tokenizer.pad_token is not None and tokenizer.pad_token_id != tokenizer.eos_token_id, (
         f"pad_token ({tokenizer.pad_token!r}) must differ from eos_token ({tokenizer.eos_token!r})."
@@ -262,6 +266,31 @@ def run_training():
         seed=3407,
         report_to="mlflow",
     )
+    # ── Token-accuracy metric ────────────────────────────────────────────────────
+    def preprocess_logits_for_metrics(logits, labels):
+        """Reduce (batch × seq × vocab) logits → argmax IDs before accumulation.
+
+        Without this, the full vocab-dim tensor is kept in host RAM for every eval
+        batch and quickly causes OOM on long sequences.  The returned int-tensor is
+        passed as `predictions` to compute_token_accuracy below.
+        """
+        if isinstance(logits, tuple):   # some model heads return (logits, past_kv, …)
+            logits = logits[0]
+        return logits.argmax(dim=-1)    # (batch, seq_len)  — stays on GPU until numpy copy
+
+    def compute_token_accuracy(eval_pred):
+        """Token-level accuracy restricted to supervised (label != -100) positions only.
+
+        Masked positions (instruction / padding) are excluded so the number reflects
+        how well the model predicts the *JSON response*, not trivially-masked tokens.
+        MLflow receives this as eval_token_accuracy after every eval epoch.
+        """
+        pred_ids, labels = eval_pred   # both numpy arrays  (n_examples × seq_len)
+        mask = labels != -100
+        n_total   = int(mask.sum())
+        n_correct = int(((pred_ids == labels) & mask).sum())
+        return {"token_accuracy": n_correct / n_total if n_total > 0 else 0.0}
+
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
@@ -269,6 +298,8 @@ def run_training():
         eval_dataset=eval_dataset,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
         args=args,
+        compute_metrics=compute_token_accuracy,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
     trainer = train_on_responses_only(
         trainer, instruction_part=INSTRUCTION_PART, response_part=RESPONSE_PART
@@ -292,43 +323,43 @@ def run_training():
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
 
-    mlflow.set_experiment(EXPERIMENT_PATH)
-    with mlflow.start_run(run_name=RUN_TAG, log_system_metrics=True) as run:
-        # Keys deliberately avoid TrainingArguments names (e.g. learning_rate) — the Trainer's
-        # MLflow callback logs those, and MLflow rejects re-logging a key with a new value.
-        mlflow.log_params({
-            "run_tag": RUN_TAG,
-            "training_method": "lora_unsloth",
-            "base_model": BASE_MODEL,
-            "gpu_type": GPU_TYPE,
-            "lora_r": LORA_R,
-            "lora_alpha": LORA_ALPHA,
-            "lora_dropout": LORA_DROPOUT,
-            "target_modules": ",".join(TARGET_MODULES),
-            "trainable_params": trainable,
-            "trainable_pct": round(100 * trainable / total, 4),
-            "max_seq_length": MAX_SEQ_LENGTH,
-            "train_samples": TRAIN_KEPT,
-            "eval_samples": EVAL_KEPT,
-            "dropped_overlength_train": TRAIN_DROPPED,
-            "dropped_overlength_eval": EVAL_DROPPED,
-            "unsloth_version": unsloth.__version__,
-            "peft_version": peft.__version__,
-            "transformers_version": transformers.__version__,
-            "trl_version": trl.__version__,
-            "torch_version": torch.__version__,
-        })
-        mlflow.set_tags({"stage": "train", "approach": "peft-lora"})
+    # .distributed() already created the MLflow run and injected MLFLOW_RUN_ID —
+    # log params/metrics directly; do NOT call mlflow.start_run() or mlflow.set_experiment().
+    mlflow.log_params({
+        "run_tag": RUN_TAG,
+        "training_method": "lora_unsloth",
+        "base_model": BASE_MODEL,
+        "gpu_type": GPU_TYPE,
+        "lora_r": LORA_R,
+        "lora_alpha": LORA_ALPHA,
+        "lora_dropout": LORA_DROPOUT,
+        "target_modules": ",".join(TARGET_MODULES),
+        "trainable_params": trainable,
+        "trainable_pct": round(100 * trainable / total, 4),
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "train_samples": TRAIN_KEPT,
+        "eval_samples": EVAL_KEPT,
+        "dropped_overlength_train": TRAIN_DROPPED,
+        "dropped_overlength_eval": EVAL_DROPPED,
+        "unsloth_version": unsloth.__version__,
+        "peft_version": peft.__version__,
+        "transformers_version": transformers.__version__,
+        "trl_version": trl.__version__,
+        "torch_version": torch.__version__,
+    })
+    mlflow.set_tags({"stage": "train", "approach": "peft-lora"})
 
-        train_result = trainer.train()
-        eval_metrics = trainer.evaluate()
+    train_result = trainer.train()
+    eval_metrics = trainer.evaluate()
 
-        # PEFT save_model writes ONLY the adapter (~170 MB at r=16) — small enough for the Volume.
-        trainer.save_model(ADAPTER_DIR)
-        tokenizer.save_pretrained(ADAPTER_DIR)
+    # PEFT save_model writes ONLY the adapter (~170 MB at r=16) — small enough for the Volume.
+    trainer.save_model(ADAPTER_DIR)
+    tokenizer.save_pretrained(ADAPTER_DIR)
 
+    run_id = mlflow.active_run().info.run_id
+    tok_acc = eval_metrics.get("eval_token_accuracy", float("nan"))
     print(f"Training complete. train_loss={train_result.metrics['train_loss']:.4f} "
-          f"eval_loss={eval_metrics['eval_loss']:.4f}  (MLflow run {run.info.run_id})")
+          f"eval_loss={eval_metrics['eval_loss']:.4f}  token_acc={tok_acc:.4f}  (MLflow run {run_id})")
     print(f"Versions: unsloth={unsloth.__version__} peft={peft.__version__} "
           f"transformers={transformers.__version__} trl={trl.__version__} torch={torch.__version__}")
 

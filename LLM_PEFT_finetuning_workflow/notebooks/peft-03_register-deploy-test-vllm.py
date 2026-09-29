@@ -25,8 +25,8 @@
 
 # DBTITLE 1,Install opencv pin (pass 2, no deps)
 # opencv-python-headless >=4.13 fails the FIPS self-test and aborts vLLM (spec G11).
-# MAGIC %pip install --no-deps opencv-python-headless==4.12.0.88
-# MAGIC %restart_python
+%pip install --no-deps opencv-python-headless==4.12.0.88
+%restart_python
 
 # COMMAND ----------
 
