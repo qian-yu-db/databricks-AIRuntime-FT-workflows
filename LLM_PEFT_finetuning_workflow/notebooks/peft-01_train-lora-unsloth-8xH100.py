@@ -6,22 +6,26 @@
 # ///
 # DBTITLE 1,Introduction
 # MAGIC %md
-# MAGIC # PEFT Fine-Tuning — Llama 3.1 8B Instruct + Unsloth (bf16 LoRA on H100)
+# MAGIC # PEFT Fine-Tuning — Llama 3.1 8B Instruct + Unsloth (bf16 LoRA on 8×H100)
 # MAGIC
-# MAGIC Parameter-efficient fine-tuning of **Llama 3.1 8B Instruct** for title-insurance entity
+# MAGIC Distributed parameter-efficient fine-tuning of **Llama 3.1 8B Instruct** for title-insurance entity
 # MAGIC extraction (OCR text → sparse JSON), on the **same train/val tables** as the FFT workflow
 # MAGIC (`agency_ft_dataset_{train,val}_v3`, built by FFT notebook 00).
 # MAGIC
 # MAGIC - **Unsloth** LoRA with **response-only loss** (loss only on the assistant JSON turn)
-# MAGIC - **`@distributed(gpus=1, gpu_type=...)`** from `serverless_gpu` launches training on one GPU
+# MAGIC - **`@distributed(gpus=8, gpu_type=...)`** from `serverless_gpu` launches DDP training across 8 GPUs
+# MAGIC - Each rank loads the model onto its own device via `device_map={'': local_rank}`
 # MAGIC - **MLflow** tracks the run; only the **LoRA adapter** is saved (merge happens in notebook 02)
 # MAGIC
-# MAGIC | Base | Precision | GPU | `max_seq_length` | batch × accum |
+# MAGIC | Base | Precision | GPU | `max_seq_length` | batch × accum × GPUs |
 # MAGIC | --- | --- | --- | --- | --- |
-# MAGIC | `unsloth/Meta-Llama-3.1-8B-Instruct` | bf16 LoRA | 1×H100 | 16384 (covers ~all documents) | 1 × 8 |
+# MAGIC | `unsloth/Meta-Llama-3.1-8B-Instruct` | bf16 LoRA | 8×H100 | 16384 (covers \~all documents) | 1 × 1 × 8 |
 # MAGIC
-# MAGIC **Compute:** Serverless GPU with the **AI v6** environment. Do **not** install vLLM in this
+# MAGIC **Compute:** Serverless GPU with the **AI v6** environment (8×H100 accelerator). Do **not** install vLLM in this
 # MAGIC notebook — Unsloth and vLLM pin conflicting torch/transformers (spec G1).
+# MAGIC
+# MAGIC Adapted from the single-GPU notebook `peft-01_train-lora-unsloth` and the
+# MAGIC [Databricks distributed Unsloth tutorial](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-finetune-llama-unsloth-distributed).
 
 # COMMAND ----------
 
@@ -31,6 +35,7 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Widgets
 dbutils.widgets.text("catalog", "fins_genai", "Catalog")
 dbutils.widgets.text("schema", "fine_tuning", "Schema")
 dbutils.widgets.text("volume", "training_data", "Volume")
@@ -40,7 +45,9 @@ dbutils.widgets.text("base_model", "unsloth/Meta-Llama-3.1-8B-Instruct", "Base m
 dbutils.widgets.text("gpu_type", "H100", "GPU type")
 dbutils.widgets.text("max_seq_length", "16384", "Max sequence length")
 dbutils.widgets.text("per_device_batch_size", "1", "Per-device batch size")
-dbutils.widgets.text("gradient_accumulation_steps", "8", "Gradient accumulation steps")
+# With 8 GPUs via DDP the effective batch = per_device × num_gpus × accum.
+# Default 1 keeps effective batch = 1 × 8 × 1 = 8, same as the single-GPU notebook (1 × 1 × 8).
+dbutils.widgets.text("gradient_accumulation_steps", "1", "Gradient accumulation steps")
 # LoRA / optimizer settings.
 dbutils.widgets.text("lora_r", "16", "LoRA rank r")
 dbutils.widgets.text("lora_alpha", "16", "LoRA alpha")
@@ -89,10 +96,13 @@ ADAPTER_DIR = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME_MODEL}/agency-peft-adapter-{
 INSTRUCTION_PART = "<|start_header_id|>user<|end_header_id|>\n\n"
 RESPONSE_PART = "<|start_header_id|>assistant<|end_header_id|>\n\n"
 
+NUM_GPUS = 8  # 8×H100 DDP
+
 print(f"base_model:     {BASE_MODEL}  (bf16)")
-print(f"gpu_type:       {GPU_TYPE}")
+print(f"gpu_type:       {NUM_GPUS}x{GPU_TYPE}")
 print(f"max_seq_length: {MAX_SEQ_LENGTH}")
-print(f"batch x accum:  {PER_DEVICE_BATCH_SIZE} x {GRADIENT_ACCUMULATION_STEPS}")
+print(f"batch x accum x gpus: {PER_DEVICE_BATCH_SIZE} x {GRADIENT_ACCUMULATION_STEPS} x {NUM_GPUS}  "
+      f"(effective batch = {PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * NUM_GPUS})")
 print(f"LoRA:           r={LORA_R} alpha={LORA_ALPHA} dropout={LORA_DROPOUT}")
 print(f"lr / epochs:    {LEARNING_RATE} / {NUM_EPOCHS}")
 print(f"RUN_TAG:        {RUN_TAG}")
@@ -190,15 +200,24 @@ print("\n✓ Masking preview OK: loss falls only on the assistant JSON turn, end
 
 # COMMAND ----------
 
-# DBTITLE 1,Define the single-GPU training function
+# DBTITLE 1,Define the 8×H100 distributed training function
 from serverless_gpu import distributed
 
 
-@distributed(gpus=1, gpu_type=GPU_TYPE)
+@distributed(gpus=NUM_GPUS, gpu_type=GPU_TYPE)
 def run_training():
-    """Unsloth bf16 LoRA SFT with response-only loss; saves only the adapter."""
+    """Unsloth bf16 LoRA SFT with response-only loss on 8×H100 DDP; saves only the adapter.
+
+    Key difference from the single-GPU notebook:
+    - Each rank sets torch.cuda.set_device(local_rank) before loading.
+    - FastLanguageModel.from_pretrained gets device_map={'': local_rank} so each
+      rank loads the model onto its own GPU (without this, all 8 load onto GPU 0 → OOM).
+    - MLflow params/tags and assertions run only on rank 0.
+    Ref: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-finetune-llama-unsloth-distributed
+    """
     import os
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
 
     import unsloth  # must precede transformers/trl/peft (spec G3)
     from unsloth import FastLanguageModel
@@ -212,16 +231,18 @@ def run_training():
     from transformers import DataCollatorForSeq2Seq
     from trl import SFTConfig, SFTTrainer
 
+    # ---- DDP device placement: each rank → its own GPU --------------------------------
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    is_main = int(os.environ.get("RANK", 0)) == 0
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=BASE_MODEL,
         max_seq_length=MAX_SEQ_LENGTH,
         dtype=None,  # auto: bf16 on H100
         load_in_4bit=False,  # bf16 weights (not quantized)
+        device_map={'': local_rank},  # ← critical: place model on this rank's GPU
     )
-    # apply_chat_template already embedded <|begin_of_text|>; stop the tokenizer from
-    # prepending a duplicate when SFTTrainer tokenizes the text field.
-    tokenizer.add_bos_token = False
-
     # pad == eos would mask <|eot_id|> out of the labels -> the model never learns to stop.
     assert tokenizer.pad_token is not None and tokenizer.pad_token_id != tokenizer.eos_token_id, (
         f"pad_token ({tokenizer.pad_token!r}) must differ from eos_token ({tokenizer.eos_token!r})."
@@ -234,12 +255,21 @@ def run_training():
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        # "unsloth" gradient checkpointing conflicts with DDP hooks; use standard PyTorch.
+        use_gradient_checkpointing=True,
         random_state=3407,
     )
 
     train_dataset = load_from_disk(TRAIN_DATASET_PATH)
     eval_dataset = load_from_disk(EVAL_DATASET_PATH)
+
+    # The driver-side text (cell 6) starts with <|begin_of_text|> from apply_chat_template.
+    # Strip it so the tokenizer naturally adds exactly one BOS during SFTTrainer tokenization
+    # — avoids the double-BOS that occurs when text already contains the BOS string and the
+    # tokenizer also prepends one (Unsloth + DDP does not fully respect add_bos_token=False).
+    bos_str = "<|begin_of_text|>"
+    train_dataset = train_dataset.map(lambda x: {"text": x["text"].removeprefix(bos_str)})
+    eval_dataset = eval_dataset.map(lambda x: {"text": x["text"].removeprefix(bos_str)})
 
     args = SFTConfig(
         output_dir=OUTPUT_DIR,
@@ -265,8 +295,11 @@ def run_training():
         metric_for_best_model="eval_loss",
         seed=3407,
         report_to="mlflow",
+        # DDP + gradient checkpointing causes reentrant backward that marks params
+        # ready twice. This flag disables unused-parameter search, avoiding the conflict.
+        ddp_find_unused_parameters=False,
     )
-    # ── Token-accuracy metric ────────────────────────────────────────────────────
+    # ── Token-accuracy metric ──────────────────────────────────────────────────────────────
     def preprocess_logits_for_metrics(logits, labels):
         """Reduce (batch × seq × vocab) logits → argmax IDs before accumulation.
 
@@ -310,67 +343,77 @@ def run_training():
         trainer, instruction_part=INSTRUCTION_PART, response_part=RESPONSE_PART
     )
 
-    # Re-check masking on what the trainer will ACTUALLY see (real input_ids / labels).
-    example = trainer.train_dataset[0]
-    ids, labels = example["input_ids"], example["labels"]
-    supervised_ids = [t for t, l in zip(ids, labels) if l != -100]
-    supervised_text = tokenizer.decode(supervised_ids)
-    print(f"[mask check] tokens={len(ids)} supervised={len(supervised_ids)}")
-    print(f"[mask check] supervised head: {supervised_text[:200]!r}")
-    print(f"[mask check] supervised tail: {supervised_text[-60:]!r}")
-    assert ids[0] == tokenizer.bos_token_id and ids[1] != tokenizer.bos_token_id, (
-        "Double or missing BOS in trainer input_ids — the trainer re-added <|begin_of_text|>."
-    )
-    assert 0 < len(supervised_ids) < len(ids), "Loss mask is empty or covers the whole sequence."
-    assert supervised_text.strip().startswith("{"), "Supervised span must start with the JSON answer."
-    assert supervised_text.endswith("<|eot_id|>"), "Supervised span must end with <|eot_id|>."
+    # Re-check masking on what the trainer will ACTUALLY see (rank 0 only).
+    if is_main:
+        example = trainer.train_dataset[0]
+        ids, labels = example["input_ids"], example["labels"]
+        supervised_ids = [t for t, l in zip(ids, labels) if l != -100]
+        supervised_text = tokenizer.decode(supervised_ids)
+        print(f"[mask check] tokens={len(ids)} supervised={len(supervised_ids)}")
+        print(f"[mask check] supervised head: {supervised_text[:200]!r}")
+        print(f"[mask check] supervised tail: {supervised_text[-60:]!r}")
+        assert ids[0] == tokenizer.bos_token_id and ids[1] != tokenizer.bos_token_id, (
+            "Double or missing BOS in trainer input_ids — the trainer re-added <|begin_of_text|>."
+        )
+        assert 0 < len(supervised_ids) < len(ids), "Loss mask is empty or covers the whole sequence."
+        assert supervised_text.strip().startswith("{"), "Supervised span must start with the JSON answer."
+        assert supervised_text.endswith("<|eot_id|>"), "Supervised span must end with <|eot_id|>."
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
 
     # .distributed() already created the MLflow run and injected MLFLOW_RUN_ID —
-    # log params/metrics directly; do NOT call mlflow.start_run() or mlflow.set_experiment().
-    mlflow.log_params({
-        "run_tag": RUN_TAG,
-        "training_method": "lora_unsloth",
-        "base_model": BASE_MODEL,
-        "gpu_type": GPU_TYPE,
-        "lora_r": LORA_R,
-        "lora_alpha": LORA_ALPHA,
-        "lora_dropout": LORA_DROPOUT,
-        "target_modules": ",".join(TARGET_MODULES),
-        "trainable_params": trainable,
-        "trainable_pct": round(100 * trainable / total, 4),
-        "max_seq_length": MAX_SEQ_LENGTH,
-        "train_samples": TRAIN_KEPT,
-        "eval_samples": EVAL_KEPT,
-        "dropped_overlength_train": TRAIN_DROPPED,
-        "dropped_overlength_eval": EVAL_DROPPED,
-        "unsloth_version": unsloth.__version__,
-        "peft_version": peft.__version__,
-        "transformers_version": transformers.__version__,
-        "trl_version": trl.__version__,
-        "torch_version": torch.__version__,
-    })
-    mlflow.set_tags({"stage": "train", "approach": "peft-lora"})
+    # log params/metrics from rank 0 only to avoid duplicate calls.
+    if is_main:
+        mlflow.log_params({
+            "run_tag": RUN_TAG,
+            "training_method": "lora_unsloth_ddp",
+            "base_model": BASE_MODEL,
+            "gpu_type": GPU_TYPE,
+            "num_gpus": NUM_GPUS,
+            "lora_r": LORA_R,
+            "lora_alpha": LORA_ALPHA,
+            "lora_dropout": LORA_DROPOUT,
+            "target_modules": ",".join(TARGET_MODULES),
+            "trainable_params": trainable,
+            "trainable_pct": round(100 * trainable / total, 4),
+            "max_seq_length": MAX_SEQ_LENGTH,
+            "train_samples": TRAIN_KEPT,
+            "eval_samples": EVAL_KEPT,
+            "dropped_overlength_train": TRAIN_DROPPED,
+            "dropped_overlength_eval": EVAL_DROPPED,
+            "unsloth_version": unsloth.__version__,
+            "peft_version": peft.__version__,
+            "transformers_version": transformers.__version__,
+            "trl_version": trl.__version__,
+            "torch_version": torch.__version__,
+        })
+        mlflow.set_tags({"stage": "train", "approach": "peft-lora-ddp"})
 
-    train_result = trainer.train()
+    try:
+        train_result = trainer.train()
+    except Exception as e:
+        import traceback
+        err_msg = traceback.format_exc()[:4000]
+        if is_main:
+            mlflow.set_tag("train_error", err_msg)
+        raise
     eval_metrics = trainer.evaluate()
 
-    # PEFT save_model writes ONLY the adapter (~170 MB at r=16) — small enough for the Volume.
+    # PEFT save_model writes ONLY the adapter — HF Trainer handles rank-0 save internally.
     trainer.save_model(ADAPTER_DIR)
-    tokenizer.save_pretrained(ADAPTER_DIR)
+    if is_main:
+        tokenizer.save_pretrained(ADAPTER_DIR)
 
-    run_id = mlflow.active_run().info.run_id
-    tok_acc = eval_metrics.get("eval_token_accuracy", float("nan"))
-    print(f"Training complete. train_loss={train_result.metrics['train_loss']:.4f} "
-          f"eval_loss={eval_metrics['eval_loss']:.4f}  token_acc={tok_acc:.4f}  (MLflow run {run_id})")
-    print(f"Versions: unsloth={unsloth.__version__} peft={peft.__version__} "
-          f"transformers={transformers.__version__} trl={trl.__version__} torch={torch.__version__}")
+        run_id = mlflow.active_run().info.run_id
+        tok_acc = eval_metrics.get("eval_token_accuracy", float("nan"))
+        print(f"Training complete. train_loss={train_result.metrics['train_loss']:.4f} "
+              f"eval_loss={eval_metrics['eval_loss']:.4f}  token_acc={tok_acc:.4f}  (MLflow run {run_id})")
+        print(f"Versions: unsloth={unsloth.__version__} peft={peft.__version__} "
+              f"transformers={transformers.__version__} trl={trl.__version__} torch={torch.__version__}")
 
 
-print(f"Training function defined for 1x{GPU_TYPE}. If Unsloth compilation fails on the worker, "
-      "add os.environ['UNSLOTH_COMPILE_DISABLE'] = '1' at the top of run_training (spec G5).")
+print(f"Training function defined for {NUM_GPUS}x{GPU_TYPE} (DDP).")
 
 # COMMAND ----------
 
@@ -397,4 +440,4 @@ print(f"\n>>> run_tag for notebooks 02/03: {RUN_TAG}")
 # MAGIC    the bf16 Instruct base and scores the **validation** split (MLflow `stage=eval`).
 # MAGIC 2. Compare val runs in MLflow; take the best `run_tag` to **peft-03_register-deploy-test**.
 # MAGIC 3. If val F1 falls short: try `lr` 1e-4 / 5e-4, or a larger `lora_r` (keep `alpha/r` fixed).
-# MAGIC    If val F1 is high but train loss → ~0 and eval loss rises, try `num_epochs=2`.
+# MAGIC    If val F1 is high but train loss → \~0 and eval loss rises, try `num_epochs=2`.
